@@ -219,7 +219,7 @@ def open_camera(cam: Dict[str, Any]):
             fps = float(cam["fps"])
     else:   # fps = 0: nothing was requested; the rate is whatever the camera delivers (e.g. set by its exposure)
         fps = measure_fps(cap) or cap.get(cv2.CAP_PROP_FPS) or 30.0
-    log.info("camera streaming %dx%d, nominal %.1f fps%s", w, h, fps, "" if cam["fps"] else " (measured)")
+    log.info("camera streaming %dx%d, %.1f fps%s", w, h, fps, "" if cam["fps"] else " (first measurement, before the controls are set)")
     return cap, (w, h), float(fps)
 
 
@@ -290,10 +290,10 @@ def _lock_v4l2(cam: Dict[str, Any], ctl: Dict[str, Any]) -> set:
     if applied:
         log.info("camera controls set: %s", ", ".join(applied))
     if failed:
-        log.warning("camera does not accept: %s", ", ".join(failed))
+        log.info("not available on this camera (nothing to pin): %s", ", ".join(failed))
     if manual_exposure:
         _verify_exposure(dev, ctl["exposure"])
-    return done
+    return set(ctl)        # v4l2-ctl is authoritative: no OpenCV retry, even for controls the camera lacks
 
 
 def _verify_exposure(dev, exposure) -> None:

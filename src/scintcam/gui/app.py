@@ -260,6 +260,9 @@ class App:
         try:
             cap, size, fps = camera.open_camera(self.cfg["camera"])
             camera.lock_camera(cap, self.cfg)
+            if not self.cfg["camera"]["fps"]:       # rate set by the camera (exposure): measure it AFTER the lock
+                fps = camera.measure_fps(cap, 30) or fps
+                log.info("camera rate after locking the controls: %.2f fps (measured)", fps)
             self._open_result = ("ok", cap, size, fps)
         except Exception as e:      # reported in the GUI
             self._open_result = ("error", str(e))
@@ -272,7 +275,7 @@ class App:
         self.rec_btn.configure(state="normal")
         self.read_camera()
         if self.cfg["camera"]["stability_check"]:
-            self.root.after(1500, self.stability)
+            self.root.after(4000, self.stability)     # let the sensor settle after the format switch and the lock
         rx = self.cfg["rectify"]
         corners, lines = geometry.load_points(rx["points_json"], rx["setup_name"]) if rx["reuse"] else (None, None)
         if corners and not rx["start_with_picker"]:
