@@ -28,7 +28,7 @@ Python 3.8 or newer, with OpenCV, numpy, Pillow and Tk (`tkinter`).
 
 ```bash
 conda create -n scintcam python=3.10 && conda activate scintcam
-git clone https://github.com/<you>/scintcam && cd scintcam
+git clone https://github.com/dasyamfigari/scintcam && cd scintcam
 pip install -e ".[opencv,radial]"     # drop "opencv" if your environment already has cv2
 ```
 
