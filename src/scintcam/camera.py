@@ -380,5 +380,11 @@ def stability(levels: List[float]) -> Optional[Dict[str, Any]]:
     res = {"frames": int(v.size), "mean": float(v.mean()), "drift_pct": float(100 * (last - first) / max(first, 1e-6)),
            "rms_pct": float(100 * v.std() / max(v.mean(), 1e-6)),
            "time": datetime.datetime.now().isoformat(timespec="seconds")}
-    res["stable"] = abs(res["drift_pct"]) <= 1.0 and res["rms_pct"] <= 1.0
+    res["std"] = float(v.std())          # frame-to-frame scatter of the mean level [counts]
+    # In darkness the mean is only the black level (a few counts), so a fraction of a count reads as many percent:
+    # the test needs a lit, static scene. Below MIN_LEVEL counts it is not judged (stable = None).
+    res["stable"] = None if res["mean"] < MIN_LEVEL else (abs(res["drift_pct"]) <= 1.0 and res["rms_pct"] <= 1.0)
     return res
+
+
+MIN_LEVEL = 20.0       # mean level [counts] below which the stability check cannot judge

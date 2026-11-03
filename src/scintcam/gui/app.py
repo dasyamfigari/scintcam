@@ -455,8 +455,13 @@ class App:
     def _show_stability(self, s):
         self._stab_shown = s
         ok = s["stable"]
+        lv = f"level {s['mean']:.1f} ± {s['std']:.2f} counts"
+        if ok is None:
+            self.lbl_stab.configure(text=f"stability: scene too dark to judge ({lv})", foreground="#b26a00")
+            log.info("stability check: scene too dark to judge (%s); run it with the room lit or a steady lamp", lv)
+            return
         self.lbl_stab.configure(text=f"stability ({s['frames']} fr): drift {s['drift_pct']:+.2f}%  rms {s['rms_pct']:.2f}%  "
-                                     f"{'OK' if ok else 'NOT STABLE'}", foreground="#2e7d32" if ok else "#c62828")
+                                     f"{'OK' if ok else 'NOT STABLE'}\n{lv}", foreground="#2e7d32" if ok else "#c62828")
         if ok:
             why = "stable"
         elif abs(s["drift_pct"]) <= 1.0:     # no trend, only frame-to-frame scatter
