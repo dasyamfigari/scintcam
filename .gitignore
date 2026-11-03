@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+recordings/
+scintcam_windows.json
+rectify_points.json
+*.mkv
+*.avi

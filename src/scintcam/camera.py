@@ -1,0 +1,371 @@
+"""Camera access: open with a fallback mode ladder, pin automatic controls, read back the real driver state.
+
+A webcam's firmware is built to produce a pleasant picture, not a measurement. For profiling a scintillator screen
+the harmful automatics are, in order: auto-exposure/auto-gain (it reacts to the beam turning on, so the recorded
+intensity follows the control loop instead of the screen), auto white balance (re-weights the colour channels frame
+by frame), autofocus (changes the magnification, hence mm/px), sharpness (an edge filter that biases widths) and
+backlight compensation (a hidden, spatially varying gain). None of them can be undone afterwards, so they are pinned
+here and the state actually in use is read back from the driver and logged with every recording.
+"""
+from __future__ import annotations
+
+import datetime
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+from .config import controls as cfg_controls
+
+log = logging.getLogger("scintcam")
+IS_LINUX = sys.platform.startswith("linux")
+
+BACKENDS = {"": cv2.CAP_ANY, "v4l2": getattr(cv2, "CAP_V4L2", cv2.CAP_ANY),
+            "dshow": getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY), "msmf": getattr(cv2, "CAP_MSMF", cv2.CAP_ANY)}
+
+# config key -> (V4L2 names, legacy first then current kernels; OpenCV property or None)
+CONTROL_MAP = {
+    "auto_exposure": (["exposure_auto", "auto_exposure"], cv2.CAP_PROP_AUTO_EXPOSURE),
+    "exposure": (["exposure_absolute", "exposure_time_absolute"], cv2.CAP_PROP_EXPOSURE),
+    "gain": (["gain"], cv2.CAP_PROP_GAIN),
+    "auto_wb": (["white_balance_temperature_auto", "white_balance_automatic"], cv2.CAP_PROP_AUTO_WB),
+    "wb_temperature": (["white_balance_temperature"], cv2.CAP_PROP_WB_TEMPERATURE),
+    "autofocus": (["focus_auto", "focus_automatic_continuous"], cv2.CAP_PROP_AUTOFOCUS),
+    "focus": (["focus_absolute"], cv2.CAP_PROP_FOCUS),
+    "brightness": (["brightness"], cv2.CAP_PROP_BRIGHTNESS),
+    "contrast": (["contrast"], cv2.CAP_PROP_CONTRAST),
+    "saturation": (["saturation"], cv2.CAP_PROP_SATURATION),
+    "gamma": (["gamma"], cv2.CAP_PROP_GAMMA),
+    "sharpness": (["sharpness"], cv2.CAP_PROP_SHARPNESS),
+    "backlight": (["backlight_compensation"], cv2.CAP_PROP_BACKLIGHT),
+    "power_line_frequency": (["power_line_frequency"], None),
+}
+SWITCHES = ("auto_exposure", "auto_wb", "autofocus")   # written first: manual values are rejected while auto is on
+
+
+def _fourcc(code: str) -> int:
+    return cv2.VideoWriter_fourcc(*code)
+
+
+# --------------------------------------------------------------------------------------------------------------
+# v4l2-ctl helpers (Linux)
+# --------------------------------------------------------------------------------------------------------------
+def have_v4l2ctl() -> bool:
+    return IS_LINUX and shutil.which("v4l2-ctl") is not None
+
+
+def v4l2_device(dev) -> str:
+    return dev if isinstance(dev, str) else f"/dev/video{int(dev)}"
+
+
+def v4l2_query(dev, args: List[str]) -> Optional[str]:
+    try:
+        p = subprocess.run(["v4l2-ctl", "-d", v4l2_device(dev)] + args, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def v4l2_set(dev, name: str, value) -> bool:
+    try:
+        p = subprocess.run(["v4l2-ctl", "-d", v4l2_device(dev), "-c", f"{name}={value}"],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return False
+    return p.returncode == 0 and not p.stderr.strip()
+
+
+def v4l2_controls(dev) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Every control as {name: {value, min, max, default, flags, ...}}, parsed from v4l2-ctl -l."""
+    txt = v4l2_query(dev, ["-l"])
+    if not txt:
+        return None
+    out = {}
+    for line in txt.splitlines():
+        head, sep, rest = line.partition(":")
+        parts = head.split()
+        if not sep or len(parts) < 2 or not parts[1].startswith("0x"):   # section titles, menu items
+            continue
+        d = {}
+        for kv in rest.split():
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                try:
+                    v = int(v)
+                except ValueError:
+                    pass
+                d[k] = v
+        out[parts[0]] = d
+    return out
+
+
+def v4l2_driver_fps(dev) -> Optional[float]:
+    txt = v4l2_query(dev, ["--get-parm"])
+    for line in (txt or "").splitlines():
+        if "Frames per second" in line:
+            try:
+                return float(line.split(":")[1].split()[0])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def v4l2_format(dev) -> Optional[Dict[str, Any]]:
+    txt = v4l2_query(dev, ["--get-fmt-video"])
+    if not txt:
+        return None
+    out: Dict[str, Any] = {}
+    for line in txt.splitlines():
+        k, sep, v = (x.strip() for x in line.partition(":"))
+        if not sep:
+            continue
+        if k == "Width/Height" and "/" in v:
+            try:
+                out["width"], out["height"] = (int(x) for x in v.split("/")[:2])
+            except ValueError:
+                pass
+        elif k == "Pixel Format":
+            out["pixel_format"] = v.split()[0].strip("'")
+    return out
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Opening
+# --------------------------------------------------------------------------------------------------------------
+def mode_ladder(cam: Dict[str, Any]) -> List[Tuple[str, Optional[int], Optional[int]]]:
+    """Candidate (fourcc, width, height) modes, requested first, then standard webcam modes.
+
+    A non-standard geometry (e.g. 480x480) is the usual reason a camera opens but never streams: the driver accepts
+    the request, the buffers never fill, and every read ends in a 10 s V4L2 select() timeout.
+    """
+    w, h, fcc = int(cam["width"]), int(cam["height"]), cam["fourcc"] or ""
+    ladder = [(fcc, w, h), ("" if fcc else "MJPG", w, h), ("MJPG", 640, 480), ("", 640, 480),
+              ("MJPG", 1280, 720), ("", 1280, 720), ("", 320, 240), ("", None, None)]
+    seen, out = set(), []
+    for m in ladder:
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def _try_mode(cap, fourcc: str, w, h, fps: float, timeout: float):
+    if fourcc:
+        cap.set(cv2.CAP_PROP_FOURCC, _fourcc(fourcc))
+    if w:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    if fps:
+        cap.set(cv2.CAP_PROP_FPS, fps)
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            return frame          # only a real frame proves the mode streams
+    return None
+
+
+def _video_capture(cam: Dict[str, Any]):
+    dev = cam["device"]
+    if isinstance(dev, str) and dev.isdigit():
+        dev = int(dev)
+    return cv2.VideoCapture(dev, BACKENDS.get(cam["backend"], cv2.CAP_ANY))
+
+
+def open_camera(cam: Dict[str, Any]):
+    """Open the camera and return (cap, (width, height), nominal_fps). Raises IOError if no mode streams."""
+    log.info("opening camera %s ...", cam["device"])
+    cap = _video_capture(cam)
+    if not cap.isOpened():
+        raise IOError(f"could not open camera {cam['device']!r}: check the device, permissions (group 'video') "
+                      "and that no other program holds it")
+    frame = None
+    for i, (fcc, w, h) in enumerate(mode_ladder(cam)):
+        if i > 0:
+            if not cam["fallback"]:
+                break
+            log.warning("no frames in the requested mode; trying %s %s", fcc or "driver format",
+                        f"{w}x{h}" if w else "default size")
+        frame = _try_mode(cap, fcc, w, h, cam["fps"], cam["open_timeout_s"])
+        if frame is not None:
+            break
+    if frame is None:
+        cap.release()
+        raise IOError(f"camera {cam['device']!r} opened but never delivered a frame; run `scintcam probe` to see "
+                      "which modes it really streams")
+    h, w = frame.shape[:2]
+    if (w, h) != (int(cam["width"]), int(cam["height"])):
+        log.warning("requested %dx%d, the camera delivers %dx%d: update camera.width/height",
+                    cam["width"], cam["height"], w, h)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    if not 0 < fps <= 240:
+        fps = float(cam["fps"])
+    log.info("camera streaming %dx%d, nominal %.1f fps", w, h, fps)
+    return cap, (w, h), float(fps)
+
+
+def probe(cam: Dict[str, Any]) -> str:
+    """Report the modes the driver lists and which of them actually deliver frames."""
+    out = [f"camera probe: device {cam['device']}"]
+    if have_v4l2ctl():
+        out.append(v4l2_query(cam["device"], ["--list-formats-ext"]) or "(v4l2-ctl --list-formats-ext failed)")
+    cap = _video_capture(cam)
+    if not cap.isOpened():
+        return "\n".join(out + ["could not open the device"])
+    out.append(f"{'format':<8} {'requested':<12} {'obtained':<12} result")
+    for fcc, w, h in mode_ladder(cam):
+        f = _try_mode(cap, fcc, w, h, cam["fps"], 3.0)
+        got = f"{f.shape[1]}x{f.shape[0]}" if f is not None else "-"
+        out.append(f"{fcc or '-':<8} {f'{w}x{h}' if w else 'default':<12} {got:<12} {'ok' if f is not None else 'NO FRAMES'}")
+    cap.release()
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Locking
+# --------------------------------------------------------------------------------------------------------------
+def _v4l2_value(key: str, val):
+    if key == "auto_exposure":
+        return 1 if val is False else 3          # V4L2 exposure_auto: 1 = manual, 3 = aperture priority (auto)
+    if isinstance(val, bool):
+        return int(val)
+    return val
+
+
+def lock_camera(cap, cfg: Dict[str, Any]) -> None:
+    """Pin the controls listed in [camera.controls]. Must be called with frames flowing (UVC rejects some otherwise)."""
+    cam = cfg["camera"]
+    if not cam["lock"]:
+        log.warning("camera.lock = false: automatic controls left on; intensities are not comparable between frames")
+        return
+    ctl = cfg_controls(cfg)
+    use_v4l2 = have_v4l2ctl() if cam["use_v4l2ctl"] == "auto" else bool(cam["use_v4l2ctl"])
+    done = set()
+    if use_v4l2:
+        done = _lock_v4l2(cam, ctl)
+    elif IS_LINUX:
+        log.warning("v4l2-ctl not found (install v4l-utils): controls set through OpenCV only, less reliable")
+    _lock_opencv(cap, ctl, skip=done)
+
+
+def _lock_v4l2(cam: Dict[str, Any], ctl: Dict[str, Any]) -> set:
+    dev = cam["device"]
+    manual_exposure = ctl.get("auto_exposure") is False and ctl.get("exposure") is not None
+    if manual_exposure and cam["exposure_cycle"]:
+        # Many UVC cameras latch a manual exposure only on the auto -> manual transition: writing it while already
+        # in manual stores the number (it reads back fine) but the sensor keeps the old integration time.
+        for name in CONTROL_MAP["auto_exposure"][0]:
+            if v4l2_set(dev, name, 3):
+                break
+        time.sleep(float(cam["exposure_cycle_delay_s"]))
+    applied, failed, done = [], [], set()
+    order = [k for k in SWITCHES if k in ctl] + [k for k in ctl if k not in SWITCHES]
+    for key in order:
+        names = CONTROL_MAP[key][0] if key in CONTROL_MAP else [key]   # unknown keys: raw V4L2 control names
+        val = _v4l2_value(key, ctl[key])
+        if any(v4l2_set(dev, n, val) for n in names):
+            applied.append(f"{key}={val}")
+            done.add(key)
+        else:
+            failed.append(key)
+    if applied:
+        log.info("camera controls set: %s", ", ".join(applied))
+    if failed:
+        log.warning("camera does not accept: %s", ", ".join(failed))
+    if manual_exposure:
+        _verify_exposure(dev, ctl["exposure"])
+    return done
+
+
+def _verify_exposure(dev, exposure) -> None:
+    """A long exposure forces the sensor to slow down; if it does not fit in the frame period and the driver rate did
+    not drop, the camera is ignoring the value (reading it back would not tell)."""
+    fps = v4l2_driver_fps(dev)
+    exp_ms = 0.1 * float(exposure)      # UVC exposure unit = 100 us
+    if fps:
+        log.info("exposure %s (%.1f ms); driver reports %.1f fps", exposure, exp_ms, fps)
+        if exp_ms > 1150.0 / fps:
+            log.warning("%.1f ms does not fit in a %.1f ms frame but the rate did not drop: the camera ignores the "
+                        "manual exposure (raise exposure_cycle_delay_s, or lower camera.fps)", exp_ms, 1000.0 / fps)
+
+
+def _lock_opencv(cap, ctl: Dict[str, Any], skip: set) -> None:
+    for key in [k for k in SWITCHES if k in ctl] + [k for k in ctl if k not in SWITCHES]:
+        if key in skip or key not in CONTROL_MAP or CONTROL_MAP[key][1] is None:
+            continue
+        val = ctl[key]
+        if key == "auto_exposure":    # backend-specific encodings of "manual"
+            val = (1 if IS_LINUX else 0.25) if val is False else (3 if IS_LINUX else 0.75)
+        cap.set(CONTROL_MAP[key][1], float(val))
+        got = cap.get(CONTROL_MAP[key][1])
+        if abs(got - float(val)) > max(1e-3, 0.02 * abs(float(val))):
+            log.warning("%s: requested %s, camera reports %s", key, val, got)
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Read-back
+# --------------------------------------------------------------------------------------------------------------
+_SNAP_PROPS = ("exposure", "auto_exposure", "gain", "brightness", "contrast", "saturation", "gamma", "sharpness",
+               "wb_temperature")
+
+
+def snapshot(cfg: Dict[str, Any], cap=None) -> Dict[str, Any]:
+    """State the camera is ACTUALLY in, read back from the driver (not what the configuration asked for).
+
+    exposure_ms = 0.1 * exposure_absolute, with exposure_absolute in UVC units of 100 us; filled only in manual mode
+    (exposure_auto = 1), because in auto mode the driver keeps a stale value flagged 'inactive'.
+    """
+    dev = cfg["camera"]["device"]
+    snap: Dict[str, Any] = {"time": datetime.datetime.now().isoformat(timespec="milliseconds"),
+                            "device": v4l2_device(dev) if IS_LINUX else dev}
+    ctr = None
+    if have_v4l2ctl():
+        ctr = v4l2_controls(dev)
+        snap.update(controls=ctr, driver_fps=v4l2_driver_fps(dev), format=v4l2_format(dev))
+    elif cap is not None:   # other platforms: OpenCV read-back, units are backend-specific
+        snap["opencv"] = {k: float(cap.get(CONTROL_MAP[k][1])) for k in _SNAP_PROPS}
+    summ: Dict[str, Any] = {"exposure_mode": None, "exposure_absolute": None, "exposure_ms": None, "gain": None,
+                            "driver_fps": snap.get("driver_fps")}
+    if ctr:
+        ae = ctr.get("exposure_auto") or ctr.get("auto_exposure") or {}
+        ea = ctr.get("exposure_absolute") or ctr.get("exposure_time_absolute") or {}
+        if "value" in ae:
+            summ["exposure_mode"] = "manual" if ae["value"] == 1 else "auto"
+        if isinstance(ea.get("value"), int):
+            summ["exposure_absolute"] = ea["value"]
+            if summ["exposure_mode"] == "manual":
+                summ["exposure_ms"] = 0.1 * ea["value"]
+        if isinstance(ctr.get("gain", {}).get("value"), int):
+            summ["gain"] = ctr["gain"]["value"]
+    snap["summary"] = summ
+    snap["requested"] = cfg_controls(cfg) if cfg["camera"]["lock"] else None
+    return snap
+
+
+def changes(a: Optional[dict], b: Optional[dict]) -> Dict[str, list]:
+    """Controls whose value differs between two snapshots: {name: [before, after]}."""
+    ca, cb = (a or {}).get("controls") or {}, (b or {}).get("controls") or {}
+    return {k: [ca.get(k, {}).get("value"), cb.get(k, {}).get("value")] for k in sorted(set(ca) | set(cb))
+            if ca.get(k, {}).get("value") != cb.get(k, {}).get("value")}
+
+
+def stability(levels: List[float]) -> Optional[Dict[str, Any]]:
+    """Level drift on a static scene: the direct test that no automatic control is still adjusting.
+
+    drift_pct = 100 (mean of last 5 - mean of first 5) / mean of first 5 ;  rms_pct = 100 std / mean
+    """
+    v = np.asarray(levels, float)
+    if v.size < 5:
+        return None
+    first, last = v[:5].mean(), v[-5:].mean()
+    res = {"frames": int(v.size), "mean": float(v.mean()), "drift_pct": float(100 * (last - first) / max(first, 1e-6)),
+           "rms_pct": float(100 * v.std() / max(v.mean(), 1e-6)),
+           "time": datetime.datetime.now().isoformat(timespec="seconds")}
+    res["stable"] = abs(res["drift_pct"]) <= 1.0 and res["rms_pct"] <= 1.0
+    return res

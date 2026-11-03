@@ -1,0 +1,45 @@
+# TANDAR vertical proton beam: Chromox (Al2O3:Cr) screen imaged by a USB webcam on PC-Lab.
+# Run:  scintcam --config tandar_chromox.toml
+# Only the settings that differ from the defaults are listed (full list: scintcam --print-config).
+
+[camera]
+device = 0
+width = 480                   # what live_rectify.py used; if the camera does not stream it, the fallback reports the mode it uses
+height = 480
+fps = 22.0                    # what the camera delivers with a 40 ms exposure
+fourcc = "MJPG"
+
+[camera.controls]
+# Exposure is set by procedure (auto-exposure with room lights on, then manual), so it is NOT written here:
+# the script keeps whatever the camera has and logs the real value per clip in <stem>_settings.json.
+auto_exposure = false
+power_line_frequency = 1      # 50 Hz
+
+[rectify]
+target_mm = 32.5              # Chromox plate side
+out_size = 500
+channel = "r"                 # Cr emission is red
+sat_level = 254
+points_json = "rectify_points.json"     # <POINTS_JSON> on PC-Lab
+
+[picker]
+first_corner = "BR"           # corners are clicked starting bottom-right
+detect_contrast = "r-g"       # red plate on aluminium / black foam
+
+[recording]
+dir = "recordings"            # <REC_DIR> on PC-Lab: video_watcher.py on Desktop-CNEA watches it for <stem>.done
+source = "both"
+
+[display]
+colormap = "hot"
+
+[readout]
+avg_frames = 25
+decimals_pos = 1
+decimals_fwhm = 1
+font_size = 14
+
+[gui]
+# Dual monitor: e.g. view on the left screen, controls on the right one (positions are also remembered on exit).
+# view_geometry = "1000x1050+0+0"
+# controls_geometry = "+1930+0"

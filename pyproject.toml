@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scintcam"
+dynamic = ["version"]
+description = "Live rectified view and lossless recording of a scintillator screen (or any square target) seen by a webcam"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "pillow",
+    "tomli; python_version < '3.11'",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Intended Audience :: Science/Research",
+]
+
+[project.optional-dependencies]
+# OpenCV is not a hard dependency: conda environments often provide their own cv2, and a second pip copy conflicts.
+opencv = ["opencv-python"]
+radial = ["scipy"]
+test = ["pytest"]
+
+[project.scripts]
+scintcam = "scintcam.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "scintcam.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+scintcam = ["default_config.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

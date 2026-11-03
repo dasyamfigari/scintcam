@@ -1,0 +1,100 @@
+# scintcam default configuration.
+# Your own file only needs the settings you change:  scintcam --print-config > my_setup.toml
+# A control written as "keep" is left exactly as the camera has it.
+
+[camera]
+device = 0                    # camera index, or a path such as "/dev/video2"
+backend = ""                  # "" = OpenCV default; "v4l2", "dshow" or "msmf" to force one
+width = 640
+height = 480
+fps = 30.0
+fourcc = "MJPG"               # requested capture format: "MJPG", "YUYV", or "" for the driver default
+fallback = true               # if the requested mode delivers no frames, try standard modes instead of hanging
+open_timeout_s = 4.0          # wait for a first frame per mode tried
+lock = true                   # pin automatic exposure, gain, white balance and focus (needed for measurements)
+use_v4l2ctl = "auto"          # Linux: set and read controls with v4l2-ctl ("auto" | true | false)
+exposure_cycle = true         # switch auto -> manual before writing a manual exposure (some UVC cameras only latch it then)
+exposure_cycle_delay_s = 0.35
+stability_check = true        # measure the level drift on a static scene after start-up
+stability_frames = 40
+
+[camera.controls]
+# Only the controls listed here are written. Values are in the camera's own units (v4l2-ctl -d /dev/video0 -l).
+# Any other V4L2 control name can be added and is passed to v4l2-ctl as is.
+auto_exposure = false         # false = manual exposure
+auto_wb = false
+autofocus = false
+sharpness = 0                 # edge enhancement changes beam edges
+backlight = 0                 # backlight compensation is a hidden automatic gain
+# exposure = 400              # UVC unit = 100 us, so 400 = 40 ms; must fit in one frame period (1/fps)
+# gain = 4
+# power_line_frequency = 1    # 1 = 50 Hz, 2 = 60 Hz (anti-flicker for room lights)
+
+[rectify]
+target_mm = 0.0               # REQUIRED: side length of the square target (e.g. scintillator screen) in mm
+out_size = 500                # side of the rectified image [px]
+margin = 0                    # px between the target edge and the image border
+radial = true                 # estimate radial distortion (k1) from straight lines picked on the target
+channel = "luma"              # analysis channel: r | g | b | luma | r_minus_g
+sat_level = 254               # pixel value counted as saturated
+points_json = "rectify_points.json"   # geometry store (same schema as beamview.write_rectification)
+setup_name = "live"           # key of the live geometry in points_json
+reuse = true                  # open the picker with the last stored corners
+start_with_picker = true      # false: go straight to the live view when a stored geometry exists
+
+[picker]
+first_corner = "TL"           # corner #1 of an auto-detection when nothing is loaded (TL | TR | BR | BL); order is clockwise on screen
+detect_contrast = "r-g"       # image used by auto-detection: "r-g" (red target), "luma" (bright target), "inv_luma" (dark target)
+detect_trim = 0.18            # fraction of each edge ignored near the corners
+detect_avg_frames = 8         # frames averaged before detecting (noise falls as 1/sqrt(N))
+loupe_radius = 16             # half-size of the magnified region [camera px]
+loupe_zoom = 7
+nudge_px = 1.0                # arrow-key step
+
+[recording]
+dir = "recordings"
+source = "both"               # raw | rectified | both
+fourcc = "FFV1"               # FFV1 is lossless; falls back to MJPG, then XVID
+ext = ".mkv"
+fps_mode = "measured"         # header fps: "measured" capture rate, or "nominal" (camera.fps)
+write_timestamps = true       # <stem>_frames.csv: capture time of every recorded frame
+write_settings = true         # <stem>_settings.json: camera state read back from the driver + rectification
+write_done = true             # <stem>.done written last: the clip files are closed and complete
+
+[hooks]
+# Command run in the background after each recording; one list element per argument.
+# Placeholders: {raw} {rect} {settings} {timestamps} {stem} {dir}. Empty list = nothing is run.
+on_recording_done = []
+enabled = true
+
+[display]
+view = "heat"                 # heat | gray | color | raw
+colormap = "inferno"          # any OpenCV colormap name (hot, jet, turbo, viridis, ...)
+grid = true                   # crosshair + grid from the image centre
+grid_mm = 5.0
+profiles = true               # 1D intensity strips (x below, y at the right)
+profile_cut = "peak"          # peak = row/column through the peak | sum = projection
+profile_size = 110            # strip thickness [px]
+profile_norm = "fixed"        # fixed = 0..sat_level (clipping visible) | auto = current maximum
+display_fps = 15.0            # GUI refresh rate; capture and recording run at the camera rate regardless
+sat_color = [0, 255, 0]       # BGR colour of saturated pixels
+
+[readout]
+enabled = true
+avg_frames = 1                # 1 = instantaneous; N > 1 = average of N frames ("frames") or N values ("values")
+avg_mode = "frames"
+every = 1                     # instantaneous mode: compute every N displayed frames
+decimals_pos = 2
+decimals_fwhm = 2
+font_size = 12                # readout font size in the controls window [pt]
+
+[seismograph]
+enabled = true
+minutes = 3.0                 # history shown
+height = 170
+y_range = []                  # [] = autoscale, or [ymin, ymax]
+
+[gui]
+view_geometry = ""            # Tk geometry of the view window, e.g. "1000x1000+0+0"; "" = remembered or automatic
+controls_geometry = ""        # same for the controls window, e.g. "+1920+0" for the second monitor
+state_file = "scintcam_windows.json"   # window positions remembered between runs ("" = off)
