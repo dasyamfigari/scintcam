@@ -4,10 +4,10 @@
 
 [camera]
 device = 0
-width = 480                   # what live_rectify.py used; if the camera does not stream it, the fallback reports the mode it uses
+width = 640                   # camera modes: scintcam probe (480x480 is not one; the camera always gave 640x480)
 height = 480
 fps = 0                       # request nothing: the exposure (set by procedure) decides the rate, which is measured
-fourcc = "MJPG"
+fourcc = "YUYV"              # uncompressed from the camera (MJPG is JPEG-compressed in the camera); 640x480 YUYV allows up to 22 fps
 
 [camera.controls]
 # Exposure is set by procedure (auto-exposure with room lights on, then manual), so it is NOT written here:
