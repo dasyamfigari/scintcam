@@ -178,6 +178,16 @@ def _video_capture(cam: Dict[str, Any]):
     return cv2.VideoCapture(dev, BACKENDS.get(cam["backend"], cv2.CAP_ANY))
 
 
+def measure_fps(cap, n: int = 20) -> float:
+    """Delivered frame rate over n reads: (n - 1) / (t_last - t_first)."""
+    t = []
+    for _ in range(n):
+        ok, _f = cap.read()
+        if ok:
+            t.append(time.monotonic())
+    return (len(t) - 1) / (t[-1] - t[0]) if len(t) > 2 and t[-1] > t[0] else 0.0
+
+
 def open_camera(cam: Dict[str, Any]):
     """Open the camera and return (cap, (width, height), nominal_fps). Raises IOError if no mode streams."""
     log.info("opening camera %s ...", cam["device"])
@@ -203,10 +213,13 @@ def open_camera(cam: Dict[str, Any]):
     if (w, h) != (int(cam["width"]), int(cam["height"])):
         log.warning("requested %dx%d, the camera delivers %dx%d: update camera.width/height",
                     cam["width"], cam["height"], w, h)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-    if not 0 < fps <= 240:
-        fps = float(cam["fps"])
-    log.info("camera streaming %dx%d, nominal %.1f fps", w, h, fps)
+    if cam["fps"]:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        if not 0 < fps <= 240:
+            fps = float(cam["fps"])
+    else:   # fps = 0: nothing was requested; the rate is whatever the camera delivers (e.g. set by its exposure)
+        fps = measure_fps(cap) or cap.get(cv2.CAP_PROP_FPS) or 30.0
+    log.info("camera streaming %dx%d, nominal %.1f fps%s", w, h, fps, "" if cam["fps"] else " (measured)")
     return cap, (w, h), float(fps)
 
 

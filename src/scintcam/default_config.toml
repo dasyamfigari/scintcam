@@ -7,7 +7,7 @@ device = 0                    # camera index, or a path such as "/dev/video2"
 backend = ""                  # "" = OpenCV default; "v4l2", "dshow" or "msmf" to force one
 width = 640
 height = 480
-fps = 30.0
+fps = 30.0                    # requested rate; 0 = request nothing and use what the camera delivers (measured)
 fourcc = "MJPG"               # requested capture format: "MJPG", "YUYV", or "" for the driver default
 fallback = true               # if the requested mode delivers no frames, try standard modes instead of hanging
 open_timeout_s = 4.0          # wait for a first frame per mode tried

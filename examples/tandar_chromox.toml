@@ -6,7 +6,7 @@
 device = 0
 width = 480                   # what live_rectify.py used; if the camera does not stream it, the fallback reports the mode it uses
 height = 480
-fps = 22.0                    # what the camera delivers with a 40 ms exposure
+fps = 0                       # request nothing: the exposure (set by procedure) decides the rate, which is measured
 fourcc = "MJPG"
 
 [camera.controls]
