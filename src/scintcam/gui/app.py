@@ -457,9 +457,15 @@ class App:
         ok = s["stable"]
         self.lbl_stab.configure(text=f"stability ({s['frames']} fr): drift {s['drift_pct']:+.2f}%  rms {s['rms_pct']:.2f}%  "
                                      f"{'OK' if ok else 'NOT STABLE'}", foreground="#2e7d32" if ok else "#c62828")
+        if ok:
+            why = "stable"
+        elif abs(s["drift_pct"]) <= 1.0:     # no trend, only frame-to-frame scatter
+            why = ("level jumps from frame to frame without a trend: lamp flicker (exposure not a multiple of 10 ms "
+                   "at 50 Hz) or a changing scene")
+        else:
+            why = "level drifts: an automatic control is probably still active, or the scene changed"
         (log.info if ok else log.warning)("stability check: drift %+.2f%%, rms %.2f%% -> %s", s["drift_pct"],
-                                          s["rms_pct"], "stable" if ok else "level still moving: an automatic control "
-                                          "is probably active")
+                                          s["rms_pct"], why)
 
     # ===================================================================================================== actions
     def toggle_record(self):
