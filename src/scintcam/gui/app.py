@@ -81,6 +81,7 @@ class App:
         self._closing = False
         self._cam_busy = False
         self._cam_done = False
+        self._cam_shown = {}          # field -> text last read back from the camera
 
         self._vars()
         self._build_view()
@@ -582,20 +583,27 @@ class App:
             if key == "exposure_ms":
                 val = summ.get("exposure_ms")
                 var.set("" if val is None else f"{val:g}")
+                self._cam_shown[key] = var.get()
                 have = "exposure_absolute" in ctr or "exposure_time_absolute" in ctr
             else:
                 d = ctr.get(CAM_V4L2[key], {})
                 var.set("" if "value" not in d else str(d["value"]))
+                self._cam_shown[key] = var.get()
                 have = "value" in d
             entry.state(["!disabled"] if (have or not ctr) else ["disabled"])
 
-    def _camera_values(self):
-        """Typed values -> {control: value}, checked against the driver's range. Empty field = not changed."""
+    def _camera_values(self, changed_only=True):
+        """Typed values -> {control: value}, checked against the driver's range. Empty field = not changed.
+        Fields still showing the read-back value are skipped (Apply) or kept unchecked (Save): some cameras report a
+        current value outside their own declared range."""
         ctr = (self.cam_snap or {}).get("controls") or {}
         out = {}
         for key, (var, entry) in self.cam_entries.items():
             txt = var.get().strip().replace(",", ".")
             if not txt or entry.instate(["disabled"]):
+                continue
+            unchanged = txt == self._cam_shown.get(key, "").replace(",", ".")
+            if unchanged and changed_only:
                 continue
             try:
                 num = float(txt)
@@ -608,9 +616,9 @@ class App:
                 name, val = key, int(round(num))
                 d = ctr.get(CAM_V4L2[key], {})
             lo, hi = d.get("min"), d.get("max")
-            if isinstance(lo, int) and isinstance(hi, int) and not lo <= val <= hi:
+            if not unchanged and isinstance(lo, int) and isinstance(hi, int) and not lo <= val <= hi:
                 shown = (f"{lo / 10:g}-{hi / 10:g} ms" if key == "exposure_ms" else f"{lo}-{hi}")
-                raise ValueError(f"{key}: {num:g} outside the camera's range {shown}")
+                raise ValueError(f"{key}: {num:g} outside the camera's range {shown}; nothing applied")
             out[name] = val
         if "exposure" in out:
             out["auto_exposure"] = False
@@ -628,6 +636,7 @@ class App:
             log.error("%s", e)
             return
         if not vals:
+            log.info("nothing changed: edit a field, then Apply")
             return
         self.cfg["camera"]["controls"].update(vals)   # the next recordings log these as the requested values
         self._cam_busy = True
@@ -646,7 +655,7 @@ class App:
         if not path:
             return
         try:
-            vals = self._camera_values()
+            vals = self._camera_values(changed_only=False)
         except ValueError as e:
             log.error("%s", e)
             return
