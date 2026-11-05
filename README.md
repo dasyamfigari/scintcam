@@ -54,6 +54,10 @@ scintcam -c my_setup.toml
    selected one with the arrow keys (Tab selects), then **Preview** and **Use this geometry**. The geometry is saved
    and offered again next time.
 3. Live view: **space** starts and stops a recording.
+4. Camera settings: the **Camera** panel shows exposure (ms), gain, gamma, brightness, contrast and saturation as
+   read back from the driver. Type new values and press **Apply** (or Enter): the auto → manual exposure switch is
+   made for you and the fields then show what the camera accepted. **Save to config** writes the typed values into
+   `[camera.controls]` of the config file (other lines and comments are kept). Apply is disabled while recording.
 
 ![Corner picker after auto-detection, with the loupe](docs/picker.png)
 
@@ -128,6 +132,7 @@ move it, Enter preview/accept, Esc back/cancel.
   cameras only apply a manual exposure on the auto → manual transition; with `camera.exposure_cycle` the switch is
   made for you, and the driver frame rate is checked to confirm the value was applied. If you set exposure by another
   procedure, leave `exposure` out of `[camera.controls]`: it is then not touched, and the value in use is logged.
+  Values out of the driver's range are refused in the Camera panel, with the range in the log.
 
 ## Troubleshooting
 

@@ -30,6 +30,10 @@ from .picker import Picker
 
 log = logging.getLogger("scintcam")
 VIEWS = ("heat", "gray", "color", "raw")
+CAM_FIELDS = (("exposure_ms", "exposure (ms)"), ("gain", "gain"), ("gamma", "gamma"),
+              ("brightness", "brightness"), ("contrast", "contrast"), ("saturation", "saturation"))
+CAM_V4L2 = {"gain": "gain", "gamma": "gamma", "brightness": "brightness", "contrast": "contrast",
+            "saturation": "saturation"}            # field -> V4L2 control name
 AVG_STEPS = (1, 2, 4, 8, 16, 25, 32, 50, 64, 100, 128, 256)
 KEYS = ("space/v record   c/C colormap   m view   g grid   b profiles   h seismograph   e clear seismograph\n"
         "i readout   +/- averaging   s snapshot   x stability   r re-pick   q quit")
@@ -75,6 +79,8 @@ class App:
         self.cam_snap = None
         self._lut_name, self._lut = None, None
         self._closing = False
+        self._cam_busy = False
+        self._cam_done = False
 
         self._vars()
         self._build_view()
@@ -192,11 +198,26 @@ class App:
         self.lbl_cam.pack(anchor="w")
         self.lbl_stab = ttk.Label(fr, text="", justify="left")
         self.lbl_stab.pack(anchor="w", pady=(4, 0))
+        grid = ttk.Frame(fr)
+        grid.pack(fill="x", pady=(6, 0))
+        self.cam_entries = {}
+        for i, (key, label) in enumerate(CAM_FIELDS):
+            ttk.Label(grid, text=label).grid(row=i // 3 * 2, column=i % 3, sticky="w", padx=(0, 6))
+            v = tk.StringVar()
+            e = ttk.Entry(grid, textvariable=v, width=8)
+            e.grid(row=i // 3 * 2 + 1, column=i % 3, sticky="w", padx=(0, 6))
+            e.bind("<Return>", lambda ev: self.apply_camera())
+            self.cam_entries[key] = (v, e)
         row = ttk.Frame(fr)
         row.pack(fill="x", pady=(6, 0))
+        self.btn_apply = ttk.Button(row, text="Apply", command=self.apply_camera)
+        self.btn_apply.pack(side="left")
+        self.btn_save = ttk.Button(row, text="Save to config", command=self.save_camera)
+        self.btn_save.pack(side="left", padx=4)
+        if not self.cfg.get("_path"):
+            self.btn_save.state(["disabled"])
         ttk.Button(row, text="Read state", command=self.read_camera).pack(side="left")
-        ttk.Button(row, text="Re-apply lock", command=self.relock).pack(side="left", padx=4)
-        ttk.Button(row, text="Stability [x]", command=self.stability).pack(side="left")
+        ttk.Button(row, text="Stability [x]", command=self.stability).pack(side="left", padx=4)
 
         # --- geometry -------------------------------------------------------------------------------------------
         fr = ttk.LabelFrame(main, text="Rectification", padding=6)
@@ -329,6 +350,12 @@ class App:
                 log.error("%s", res[1])
                 self.img_label.configure(text="camera not available:\n" + res[1])
                 messagebox.showerror("scintcam", res[1], parent=self.root)
+        if self._cam_done:
+            self._cam_done = self._cam_busy = False
+            self.read_camera()
+            s = self.cam_snap["summary"]
+            log.info("camera now: exposure %s%s, gain %s, driver %s fps", s["exposure_mode"],
+                     "" if s["exposure_ms"] is None else f" {s['exposure_ms']:g} ms", s["gain"], s["driver_fps"])
         if self.engine is not None:
             try:
                 self._render()
@@ -438,6 +465,7 @@ class App:
             self.lbl_rec.configure(text="idle" if e.error is None else f"CAMERA: {e.error}",
                                    foreground="" if e.error is None else "#c62828")
             self.rec_btn.configure(text="●  RECORD  [space]", bg="#2e7d32", activebackground="#388e3c")
+        self.btn_apply.state(["disabled"] if (rec.active or self._cam_busy) else ["!disabled"])
         hdr = f"   header {rec.header_fps:.2f} fps" if rec.active else ""
         self.lbl_rate.configure(text=f"capture {e.capture_fps:.2f} fps (nominal {e.nominal_fps:.1f}){hdr}")
         if rec.last:
@@ -541,9 +569,96 @@ class App:
         size = f"{fmt.get('width', self.cam_size[0])}x{fmt.get('height', self.cam_size[1])} {fmt.get('pixel_format', '')}"
         exp = (f"{s['exposure_mode']}" + (f", {s['exposure_ms']:.1f} ms" if s["exposure_ms"] is not None else "")
                if s["exposure_mode"] else "n/a (no v4l2-ctl)")
+        self._fill_camera_fields()
         self.lbl_cam.configure(text=f"device {self.cfg['camera']['device']}   {size}\n"
                                     f"exposure {exp}   gain {s['gain'] if s['gain'] is not None else 'n/a'}\n"
                                     f"driver fps {s['driver_fps'] if s['driver_fps'] else 'n/a'}")
+
+    def _fill_camera_fields(self):
+        """Fields show what the camera really has (driver read-back); controls it lacks are disabled."""
+        ctr = (self.cam_snap or {}).get("controls") or {}
+        summ = (self.cam_snap or {}).get("summary") or {}
+        for key, (var, entry) in self.cam_entries.items():
+            if key == "exposure_ms":
+                val = summ.get("exposure_ms")
+                var.set("" if val is None else f"{val:g}")
+                have = "exposure_absolute" in ctr or "exposure_time_absolute" in ctr
+            else:
+                d = ctr.get(CAM_V4L2[key], {})
+                var.set("" if "value" not in d else str(d["value"]))
+                have = "value" in d
+            entry.state(["!disabled"] if (have or not ctr) else ["disabled"])
+
+    def _camera_values(self):
+        """Typed values -> {control: value}, checked against the driver's range. Empty field = not changed."""
+        ctr = (self.cam_snap or {}).get("controls") or {}
+        out = {}
+        for key, (var, entry) in self.cam_entries.items():
+            txt = var.get().strip().replace(",", ".")
+            if not txt or entry.instate(["disabled"]):
+                continue
+            try:
+                num = float(txt)
+            except ValueError:
+                raise ValueError(f"{key}: '{txt}' is not a number")
+            if key == "exposure_ms":           # UVC exposure unit = 100 us
+                name, val = "exposure", int(round(num * 10))
+                d = ctr.get("exposure_absolute") or ctr.get("exposure_time_absolute") or {}
+            else:
+                name, val = key, int(round(num))
+                d = ctr.get(CAM_V4L2[key], {})
+            lo, hi = d.get("min"), d.get("max")
+            if isinstance(lo, int) and isinstance(hi, int) and not lo <= val <= hi:
+                shown = (f"{lo / 10:g}-{hi / 10:g} ms" if key == "exposure_ms" else f"{lo}-{hi}")
+                raise ValueError(f"{key}: {num:g} outside the camera's range {shown}")
+            out[name] = val
+        if "exposure" in out:
+            out["auto_exposure"] = False
+        return out
+
+    def apply_camera(self):
+        if self.cap is None or self._cam_busy:
+            return
+        if self.engine is not None and self.engine.recorder.active:
+            log.warning("camera settings cannot change during a recording; stop it first")
+            return
+        try:
+            vals = self._camera_values()
+        except ValueError as e:
+            log.error("%s", e)
+            return
+        if not vals:
+            return
+        self.cfg["camera"]["controls"].update(vals)   # the next recordings log these as the requested values
+        self._cam_busy = True
+        self.btn_apply.state(["disabled"])
+        log.info("applying camera settings: %s", ", ".join(f"{k}={v}" for k, v in vals.items()))
+
+        def work():        # v4l2-ctl calls and the auto->manual pause take ~0.5 s: off the GUI thread
+            try:
+                camera.lock_camera(self.cap, self.cfg)
+            finally:
+                self._cam_done = True
+        threading.Thread(target=work, daemon=True).start()
+
+    def save_camera(self):
+        path = self.cfg.get("_path")
+        if not path:
+            return
+        try:
+            vals = self._camera_values()
+        except ValueError as e:
+            log.error("%s", e)
+            return
+        if not vals:
+            return
+        from ..config import save_controls
+        try:
+            save_controls(path, vals)
+        except Exception as e:
+            log.error("could not save to %s: %s", path, e)
+            return
+        log.info("saved to %s [camera.controls]: %s", os.path.basename(path), ", ".join(f"{k}={v}" for k, v in vals.items()))
 
     def relock(self):
         if self.cap is not None:

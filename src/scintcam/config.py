@@ -63,5 +63,49 @@ def controls(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in cfg["camera"]["controls"].items() if v != KEEP}
 
 
+def _toml_value(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return repr(v)
+
+
+def save_controls(path: str, values: Dict[str, Any]) -> None:
+    """Write `values` into the [camera.controls] table of the TOML file at `path`, editing only those lines.
+
+    A key already set in the table keeps its line (and its trailing comment) with the new value; a missing key is
+    added at the end of the table; a missing table is appended. Commented-out lines are left alone. The result is
+    parsed before it replaces the file, so a failure never leaves a broken config.
+    """
+    import re
+    p = Path(path)
+    lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+    head = re.compile(r"^\s*\[\s*camera\s*\.\s*controls\s*\]\s*(#.*)?$")
+    table = re.compile(r"^\s*\[")
+    start = next((i for i, l in enumerate(lines) if head.match(l.rstrip("\r\n"))), None)
+    todo = dict(values)
+    if start is None:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines += ["\n", "[camera.controls]\n"] + [f"{k} = {_toml_value(v)}\n" for k, v in todo.items()]
+    else:
+        end = next((i for i in range(start + 1, len(lines)) if table.match(lines[i])), len(lines))
+        for i in range(start + 1, end):
+            m = re.match(r"^(\s*)([A-Za-z0-9_]+)(\s*=\s*)([^#\r\n]*?)(\s*#.*)?(\r?\n)?$", lines[i])
+            if m and m.group(2) in todo:
+                lines[i] = (m.group(1) + m.group(2) + m.group(3) + _toml_value(todo.pop(m.group(2)))
+                            + (("  " + m.group(5).strip()) if m.group(5) else "") + (m.group(6) or "\n"))
+        last = end
+        while last > start + 1 and not lines[last - 1].strip():   # insert before the blank lines that end the table
+            last -= 1
+        lines[last:last] = [f"{k} = {_toml_value(v)}\n" for k, v in todo.items()]
+    text = "".join(lines)
+    tomllib.loads(text)                     # refuse to write anything that does not parse
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(p)
+
+
 def snapshot(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return copy.deepcopy({k: v for k, v in cfg.items() if not k.startswith("_")})

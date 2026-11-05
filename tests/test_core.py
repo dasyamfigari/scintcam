@@ -132,3 +132,16 @@ def test_gui_imports():
     pytest.importorskip("tkinter")
     pytest.importorskip("PIL.ImageTk")
     from scintcam.gui import app, picker  # noqa: F401
+
+
+def test_save_controls_edits_only_camera_controls(tmp_path):
+    from scintcam.config import save_controls
+    p = tmp_path / "c.toml"
+    p.write_text("[camera.controls]\ngain = 4        # keep me\n\n[rectify]\ntarget_mm = 32.5\n")
+    save_controls(str(p), {"gain": 10, "exposure": 125, "auto_exposure": False})
+    save_controls(str(p), {"exposure": 200})
+    txt = p.read_text()
+    cfg = load_config(str(p))
+    assert cfg["camera"]["controls"]["gain"] == 10 and cfg["camera"]["controls"]["exposure"] == 200
+    assert cfg["camera"]["controls"]["auto_exposure"] is False and cfg["rectify"]["target_mm"] == 32.5
+    assert "# keep me" in txt and txt.count("\nexposure =") == 1

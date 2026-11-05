@@ -10,8 +10,9 @@ fps = 0                       # request nothing: the exposure (set by procedure)
 fourcc = "YUYV"              # uncompressed from the camera (MJPG is JPEG-compressed in the camera); 640x480 YUYV allows up to 22 fps
 
 [camera.controls]
-# Exposure is set by procedure (auto-exposure with room lights on, then manual), so it is NOT written here:
-# the script keeps whatever the camera has and logs the real value per clip in <stem>_settings.json.
+# Exposure is set by procedure (auto-exposure with room lights on, then manual), so it is not written here by
+# default: the camera keeps what it has and the real value is logged per clip. The Camera panel (Apply, then
+# Save to config) can set it and write exposure (100 us units), gain, gamma, ... below.
 auto_exposure = false
 power_line_frequency = 1      # 50 Hz
 
