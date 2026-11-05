@@ -83,6 +83,7 @@ class App:
         self._cam_done = False
         self._ae_read = None          # auto exposure on: latest exposure read from the driver (ms), from a thread
         self._ae_next = 0.0
+        self._ae_stale = None         # exposure_absolute stored when auto was switched on (many cameras keep reporting it)
         self._cam_shown = {}          # field -> text last read back from the camera
 
         self._vars()
@@ -603,8 +604,9 @@ class App:
         for key, (var, entry) in self.cam_entries.items():
             if key == "exposure_ms":
                 val = summ.get("exposure_ms")
-                if auto and summ.get("exposure_absolute") is not None:     # what auto exposure chose (read-only)
-                    val = 0.1 * summ["exposure_absolute"]
+                if auto:      # shown only once it differs from the stored manual value, i.e. it is really live
+                    ea = summ.get("exposure_absolute")
+                    val = 0.1 * ea if ea is not None and ea != self._ae_stale else None
                 var.set("" if val is None else f"{val:g}")
                 self._cam_shown[key] = var.get()
                 have = "exposure_absolute" in ctr or "exposure_time_absolute" in ctr
@@ -614,6 +616,8 @@ class App:
                 self._cam_shown[key] = var.get()
                 have = "value" in d
             entry.state(["!disabled"] if ((have or not ctr) and not (auto and key == "exposure_ms")) else ["disabled"])
+        if auto and not self.cam_entries["exposure_ms"][0].get():
+            self.lbl_ae.configure(text="ON: not for measurements; camera does not report its exposure")
 
     def _camera_values(self, changed_only=True):
         """Typed values -> {control: value}, checked against the driver's range. Empty field = not changed.
@@ -677,10 +681,12 @@ class App:
         """While auto exposure is on, show the exposure the camera is choosing (read about once a second)."""
         if self._ae_read is not None:
             ms, self._ae_read = self._ae_read, None
-            if self.var_ae.get() and not self._cam_busy:
+            if self.var_ae.get() and not self._cam_busy and self._ae_stale is not None \
+                    and round(ms * 10) != self._ae_stale:
                 txt = f"{ms:g}"
                 self.cam_entries["exposure_ms"][0].set(txt)
                 self._cam_shown["exposure_ms"] = txt
+                self.lbl_ae.configure(text="ON: not for measurements")
         now = time.monotonic()
         if not self.var_ae.get() or self._cam_busy or self.cap is None or now < self._ae_next:
             return
@@ -692,6 +698,8 @@ class App:
             ea = ctr.get("exposure_absolute") or ctr.get("exposure_time_absolute") or {}
             if isinstance(ea.get("value"), int):
                 self._ae_read = 0.1 * ea["value"]
+            if (ctr.get("exposure_auto") or ctr.get("auto_exposure") or {}).get("value") == 1:
+                self._ae_read = None       # switched to manual meanwhile
         threading.Thread(target=work, daemon=True).start()
 
     def toggle_auto_exposure(self):
@@ -703,13 +711,14 @@ class App:
             return
         ctl = self.cfg["camera"]["controls"]
         ctl["auto_exposure"] = want
-        ctl.pop("exposure", None)      # ON: the camera chooses; OFF: it keeps the value auto exposure found
+        ctl.pop("exposure", None)
         if want:
+            self._ae_stale = ((self.cam_snap or {}).get("summary") or {}).get("exposure_absolute")
             log.warning("auto exposure ON: the camera changes the exposure with the scene brightness, so intensities "
                         "are NOT comparable between frames or clips. Use it only to find a setting, then switch it off.")
         else:
-            log.info("auto exposure OFF: exposure fixed at the last value the camera chose; "
-                     "type exposure (ms) and Apply to set another")
+            log.info("auto exposure OFF: manual again; the camera may return to its stored manual exposure rather "
+                     "than keep the auto one. Type exposure (ms) and Apply to set it")
         self._cam_busy = True
         self.btn_apply.state(["disabled"])
 

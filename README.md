@@ -58,10 +58,11 @@ scintcam -c my_setup.toml
    read back from the driver. Type new values and press **Apply** (or Enter): the auto → manual exposure switch is
    made for you and the fields then show what the camera accepted. **Save to config** writes the typed values into
    `[camera.controls]` of the config file (other lines and comments are kept). Apply is disabled while recording.
-   The **auto exposure** box switches the camera's automatic exposure on (the field then shows, about once a second,
-   the exposure the camera is choosing; orange warning: intensities
-   are not comparable between frames or clips) or off (the camera keeps the last exposure it chose, the usual
-   "lights on, auto, then manual" procedure). Starting a recording with it on logs a warning.
+   The **auto exposure** box switches the camera's automatic exposure on (orange warning: intensities are not
+   comparable between frames or clips) or off. While it is on, the field shows the exposure the camera is choosing,
+   read about once a second, but only if the camera reports it: many keep reporting the stored manual value, and then
+   the field stays empty. Switching it off, such cameras go back to their stored manual exposure, not the auto one.
+   Starting a recording with it on logs a warning.
 
 ![Corner picker after auto-detection, with the loupe](docs/picker.png)
 
@@ -133,8 +134,8 @@ move it, Enter preview/accept, Esc back/cancel.
   interpolated once. Radial distortion is fitted from lines picked on straight edges; short edges near the image
   centre cannot constrain it, use long edges far from the centre.
 - **Exposure.** UVC exposure is in units of 100 µs (400 = 40 ms) and must fit in one frame period (1/fps). Many UVC
-  cameras only apply a manual exposure on the auto → manual transition; with `camera.exposure_cycle` the switch is
-  made for you, and the driver frame rate is checked to confirm the value was applied. If you set exposure by another
+  cameras only apply a manual exposure on the auto → manual transition, and use the value stored at that moment;
+  with `camera.exposure_cycle` the value is stored first and the switch is made for you, and the driver frame rate is checked to confirm the value was applied. If you set exposure by another
   procedure, leave `exposure` out of `[camera.controls]`: it is then not touched, and the value in use is logged.
   Values out of the driver's range are refused in the Camera panel, with the range in the log.
 

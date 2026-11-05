@@ -272,11 +272,21 @@ def _lock_v4l2(cam: Dict[str, Any], ctl: Dict[str, Any]) -> set:
     manual_exposure = ctl.get("auto_exposure") is False and ctl.get("exposure") is not None
     if manual_exposure and cam["exposure_cycle"]:
         # Many UVC cameras latch a manual exposure only on the auto -> manual transition: writing it while already
-        # in manual stores the number (it reads back fine) but the sensor keeps the old integration time.
-        for name in CONTROL_MAP["auto_exposure"][0]:
-            if v4l2_set(dev, name, 3):
-                break
+        # in manual stores the number (it reads back fine) but the sensor keeps the old integration time, so a
+        # single "auto, manual, value" applies the PREVIOUS value. Sequence: auto, manual, store the value, then a
+        # second short auto -> manual transition that latches it. Cameras that apply manual writes directly end
+        # with the value too (it is written again below).
+        names = CONTROL_MAP["auto_exposure"][0]
+        exp_names = CONTROL_MAP["exposure"][0]
+        mode = lambda v: any(v4l2_set(dev, n, v) for n in names)
+        mode(3)
         time.sleep(float(cam["exposure_cycle_delay_s"]))
+        mode(1)
+        any(v4l2_set(dev, n, _v4l2_value("exposure", ctl["exposure"])) for n in exp_names)
+        mode(3)
+        time.sleep(0.1)
+        mode(1)
+        time.sleep(0.1)
     applied, failed, done = [], [], set()
     order = [k for k in SWITCHES if k in ctl] + [k for k in ctl if k not in SWITCHES]
     for key in order:
