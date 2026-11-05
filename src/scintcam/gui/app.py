@@ -81,6 +81,8 @@ class App:
         self._closing = False
         self._cam_busy = False
         self._cam_done = False
+        self._ae_read = None          # auto exposure on: latest exposure read from the driver (ms), from a thread
+        self._ae_next = 0.0
         self._cam_shown = {}          # field -> text last read back from the camera
 
         self._vars()
@@ -350,6 +352,7 @@ class App:
         if self._closing:
             return
         self._drain_log()
+        self._poll_auto_exposure()
         if self._open_result is not None:
             res, self._open_result = self._open_result, None
             if res[0] == "ok":
@@ -580,7 +583,9 @@ class App:
         s = self.cam_snap["summary"]
         fmt = self.cam_snap.get("format") or {}
         size = f"{fmt.get('width', self.cam_size[0])}x{fmt.get('height', self.cam_size[1])} {fmt.get('pixel_format', '')}"
-        exp = (f"{s['exposure_mode']}" + (f", {s['exposure_ms']:.1f} ms" if s["exposure_ms"] is not None else "")
+        ems = s["exposure_ms"] if s["exposure_ms"] is not None else (
+            0.1 * s["exposure_absolute"] if s["exposure_mode"] == "auto" and s["exposure_absolute"] is not None else None)
+        exp = (f"{s['exposure_mode']}" + (f", {ems:.1f} ms" if ems is not None else "")
                if s["exposure_mode"] else "n/a (no v4l2-ctl)")
         self._fill_camera_fields()
         self.lbl_cam.configure(text=f"device {self.cfg['camera']['device']}   {size}\n"
@@ -598,6 +603,8 @@ class App:
         for key, (var, entry) in self.cam_entries.items():
             if key == "exposure_ms":
                 val = summ.get("exposure_ms")
+                if auto and summ.get("exposure_absolute") is not None:     # what auto exposure chose (read-only)
+                    val = 0.1 * summ["exposure_absolute"]
                 var.set("" if val is None else f"{val:g}")
                 self._cam_shown[key] = var.get()
                 have = "exposure_absolute" in ctr or "exposure_time_absolute" in ctr
@@ -664,6 +671,27 @@ class App:
                 camera.lock_camera(self.cap, self.cfg)
             finally:
                 self._cam_done = True
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_auto_exposure(self):
+        """While auto exposure is on, show the exposure the camera is choosing (read about once a second)."""
+        if self._ae_read is not None:
+            ms, self._ae_read = self._ae_read, None
+            if self.var_ae.get() and not self._cam_busy:
+                txt = f"{ms:g}"
+                self.cam_entries["exposure_ms"][0].set(txt)
+                self._cam_shown["exposure_ms"] = txt
+        now = time.monotonic()
+        if not self.var_ae.get() or self._cam_busy or self.cap is None or now < self._ae_next:
+            return
+        self._ae_next = now + 1.0
+        dev = self.cfg["camera"]["device"]
+
+        def work():
+            ctr = camera.v4l2_controls(dev) or {}
+            ea = ctr.get("exposure_absolute") or ctr.get("exposure_time_absolute") or {}
+            if isinstance(ea.get("value"), int):
+                self._ae_read = 0.1 * ea["value"]
         threading.Thread(target=work, daemon=True).start()
 
     def toggle_auto_exposure(self):
