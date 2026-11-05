@@ -82,7 +82,7 @@ In `recording.dir`, with `stem` = start time `YYYY-MM-DD-HHMMSS`:
 | `<stem>.mkv`, `<stem>_rect.mkv` | raw and rectified video (`recording.source`), FFV1 lossless |
 | `<stem>_frames.csv` | `frame, t_s, t_driver_ms`: host time of every frame and the driver timestamp |
 | `<stem>_settings.json` | written at start, completed at stop: camera controls read back from the driver at start and stop (exposure in ms, gain, every control, changes during the clip), last stability check, the full rectification (corners, homography, distortion, mm/px, channel) |
-| `<stem>.done` | written **last**, after every other file is closed: the clip is complete. Watchers on other machines can wait for it. `"files"` lists the videos only |
+| `<stem>.done` | written **last**, after every other file is closed: the clip is complete. Watchers on other machines can wait for it. `"files"` lists the videos only. It also carries the camera state at the start in flat keys: every V4L2 control by its driver name, `exposure` (100 µs units, manual mode only), `format`, `camera_locked`, `stab_drift_pct`, `stab_rms_pct` |
 | `rectify_points.json` | geometry of each raw clip under its file name, schema of `beamview.write_rectification` (offline tools need no re-picking) |
 
 A crash writes no `.done`, so an incomplete clip is never picked up automatically.

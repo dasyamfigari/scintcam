@@ -361,6 +361,32 @@ def snapshot(cfg: Dict[str, Any], cap=None) -> Dict[str, Any]:
     return snap
 
 
+def marker_fields(snap: Optional[dict], stab: Optional[dict], locked: bool) -> Dict[str, Any]:
+    """Flat camera keys for the <stem>.done marker, so an analysis can read them without the settings file.
+
+    Every V4L2 control at the start of the clip is copied under its driver name (raw driver value), plus:
+      exposure        = exposure_absolute, in UVC units of 100 us (exposure_ms = exposure / 10); only in manual mode,
+                        because in auto mode the stored value is stale ('inactive') and not the integration time used
+      format          = "<pixel format> <width>x<height>" streamed by the driver
+      camera_locked   = whether scintcam pinned the controls (camera.lock)
+      stab_drift_pct, stab_rms_pct = last stability check, only when it could judge (lit scene)
+    """
+    out: Dict[str, Any] = {"camera_locked": bool(locked)}
+    ctr = (snap or {}).get("controls") or {}
+    for name, d in ctr.items():
+        if "value" in d:
+            out[name] = d["value"]
+    if (snap or {}).get("summary", {}).get("exposure_mode") == "manual":
+        out["exposure"] = snap["summary"]["exposure_absolute"]
+    fmt = (snap or {}).get("format") or {}
+    if fmt.get("pixel_format") and fmt.get("width"):
+        out["format"] = f"{fmt['pixel_format']} {fmt['width']}x{fmt['height']}"
+    if stab and stab.get("stable") is not None:
+        out["stab_drift_pct"] = round(stab["drift_pct"], 3)
+        out["stab_rms_pct"] = round(stab["rms_pct"], 3)
+    return out
+
+
 def changes(a: Optional[dict], b: Optional[dict]) -> Dict[str, list]:
     """Controls whose value differs between two snapshots: {name: [before, after]}."""
     ca, cb = (a or {}).get("controls") or {}, (b or {}).get("controls") or {}

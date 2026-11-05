@@ -238,7 +238,10 @@ class Recorder:
                         {"stem": self.stem, "files": videos, "frames": self.n, "duration_s": round(dt, 2),
                          "effective_fps": round(eff, 3), "header_fps": self.header_fps,
                          "settings": os.path.basename(self._settings_path) if self._settings else None,
-                         "timestamps": os.path.basename(self.paths["timestamps"]) if "timestamps" in self.paths else None},
+                         "timestamps": os.path.basename(self.paths["timestamps"]) if "timestamps" in self.paths else None,
+                         **(camera.marker_fields(self._settings["camera"]["at_start"],
+                                                 self._settings["camera"]["stability_check"],
+                                                 self.cfg["camera"]["lock"]) if self._settings else {})},
                         indent=None)
         self.last = {"stem": self.stem, "frames": self.n, "duration_s": dt, "effective_fps": eff,
                      "paths": dict(self.paths), "settings": self._settings_path, "note": note}
