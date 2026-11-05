@@ -280,6 +280,8 @@ def _lock_v4l2(cam: Dict[str, Any], ctl: Dict[str, Any]) -> set:
     applied, failed, done = [], [], set()
     order = [k for k in SWITCHES if k in ctl] + [k for k in ctl if k not in SWITCHES]
     for key in order:
+        if key == "exposure" and ctl.get("auto_exposure") is True:      # ignored (inactive) while auto is on
+            continue
         names = CONTROL_MAP[key][0] if key in CONTROL_MAP else [key]   # unknown keys: raw V4L2 control names
         val = _v4l2_value(key, ctl[key])
         if any(v4l2_set(dev, n, val) for n in names):

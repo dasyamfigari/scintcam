@@ -58,6 +58,9 @@ scintcam -c my_setup.toml
    read back from the driver. Type new values and press **Apply** (or Enter): the auto → manual exposure switch is
    made for you and the fields then show what the camera accepted. **Save to config** writes the typed values into
    `[camera.controls]` of the config file (other lines and comments are kept). Apply is disabled while recording.
+   The **auto exposure** box switches the camera's automatic exposure on (field disabled, orange warning: intensities
+   are not comparable between frames or clips) or off (the camera keeps the last exposure it chose, the usual
+   "lights on, auto, then manual" procedure). Starting a recording with it on logs a warning.
 
 ![Corner picker after auto-detection, with the loupe](docs/picker.png)
 

@@ -211,6 +211,13 @@ class App:
             self.cam_entries[key] = (v, e)
         row = ttk.Frame(fr)
         row.pack(fill="x", pady=(6, 0))
+        self.var_ae = tk.BooleanVar(value=False)
+        self.chk_ae = ttk.Checkbutton(row, text="auto exposure", variable=self.var_ae, command=self.toggle_auto_exposure)
+        self.chk_ae.pack(side="left")
+        self.lbl_ae = ttk.Label(row, text="", foreground="#b26a00")
+        self.lbl_ae.pack(side="left", padx=(6, 0))
+        row = ttk.Frame(fr)
+        row.pack(fill="x", pady=(6, 0))
         self.btn_apply = ttk.Button(row, text="Apply", command=self.apply_camera)
         self.btn_apply.pack(side="left")
         self.btn_save = ttk.Button(row, text="Save to config", command=self.save_camera)
@@ -467,6 +474,8 @@ class App:
                                    foreground="" if e.error is None else "#c62828")
             self.rec_btn.configure(text="●  RECORD  [space]", bg="#2e7d32", activebackground="#388e3c")
         self.btn_apply.state(["disabled"] if (rec.active or self._cam_busy) else ["!disabled"])
+        if (self.cam_snap or {}).get("summary", {}).get("exposure_mode") is not None:
+            self.chk_ae.state(["disabled"] if (rec.active or self._cam_busy) else ["!disabled"])
         hdr = f"   header {rec.header_fps:.2f} fps" if rec.active else ""
         self.lbl_rate.configure(text=f"capture {e.capture_fps:.2f} fps (nominal {e.nominal_fps:.1f}){hdr}")
         if rec.last:
@@ -508,6 +517,9 @@ class App:
         if not self.engine.recorder.active and self.cfg["recording"]["source"] != "raw" and self.geom is None:
             log.error("pick the corners first (rectified recording needs a geometry)")
             return
+        if not self.engine.recorder.active and self.var_ae.get():
+            log.warning("recording with AUTO EXPOSURE ON: intensities in this clip are not comparable "
+                        "(the exposure in use is logged in the settings file)")
         self.engine.record(not self.engine.recorder.active)
 
     def _apply_hook(self):
@@ -579,6 +591,10 @@ class App:
         """Fields show what the camera really has (driver read-back); controls it lacks are disabled."""
         ctr = (self.cam_snap or {}).get("controls") or {}
         summ = (self.cam_snap or {}).get("summary") or {}
+        auto = summ.get("exposure_mode") == "auto"
+        self.var_ae.set(auto)
+        self.chk_ae.state(["disabled"] if summ.get("exposure_mode") is None else ["!disabled"])
+        self.lbl_ae.configure(text="ON: not for measurements" if auto else "")
         for key, (var, entry) in self.cam_entries.items():
             if key == "exposure_ms":
                 val = summ.get("exposure_ms")
@@ -590,7 +606,7 @@ class App:
                 var.set("" if "value" not in d else str(d["value"]))
                 self._cam_shown[key] = var.get()
                 have = "value" in d
-            entry.state(["!disabled"] if (have or not ctr) else ["disabled"])
+            entry.state(["!disabled"] if ((have or not ctr) and not (auto and key == "exposure_ms")) else ["disabled"])
 
     def _camera_values(self, changed_only=True):
         """Typed values -> {control: value}, checked against the driver's range. Empty field = not changed.
@@ -650,6 +666,32 @@ class App:
                 self._cam_done = True
         threading.Thread(target=work, daemon=True).start()
 
+    def toggle_auto_exposure(self):
+        want = self.var_ae.get()
+        if self.cap is None or self._cam_busy or (self.engine is not None and self.engine.recorder.active):
+            self.var_ae.set(not want)
+            if self.engine is not None and self.engine.recorder.active:
+                log.warning("camera settings cannot change during a recording; stop it first")
+            return
+        ctl = self.cfg["camera"]["controls"]
+        ctl["auto_exposure"] = want
+        ctl.pop("exposure", None)      # ON: the camera chooses; OFF: it keeps the value auto exposure found
+        if want:
+            log.warning("auto exposure ON: the camera changes the exposure with the scene brightness, so intensities "
+                        "are NOT comparable between frames or clips. Use it only to find a setting, then switch it off.")
+        else:
+            log.info("auto exposure OFF: exposure fixed at the last value the camera chose; "
+                     "type exposure (ms) and Apply to set another")
+        self._cam_busy = True
+        self.btn_apply.state(["disabled"])
+
+        def work():
+            try:
+                camera.lock_camera(self.cap, self.cfg)
+            finally:
+                self._cam_done = True
+        threading.Thread(target=work, daemon=True).start()
+
     def save_camera(self):
         path = self.cfg.get("_path")
         if not path:
@@ -659,6 +701,8 @@ class App:
         except ValueError as e:
             log.error("%s", e)
             return
+        if not self.chk_ae.instate(["disabled"]):
+            vals["auto_exposure"] = bool(self.var_ae.get())
         if not vals:
             return
         from ..config import save_controls
