@@ -365,7 +365,8 @@ class Diagnosis:
                              "readout_ms": round(dd * 1e3, 3),
                              "readout_ms_err": round(float(np.sqrt(cov[1, 1])) * 1e3, 3) if np.isfinite(cov[1, 1]) else None,
                              "limit_ms_err": round(float(np.sqrt(var_lim)) * u * 1e3, 3) if np.isfinite(var_lim) else None,
-                             "r2": round(float(r2), 5)}
+                             "r2": round(float(r2), 5),
+                             "points_exposure_fps": [[int(e), round(SCALE / t, 4)] for e, t in pts]}   # for residual checks
             f = r["unit_fit"]
             self.say(f"frame period = ({u * 1e6:.4f} +- {f['unit_us_err']}) us x exposure + ({dd * 1e3:.2f} +- "
                      f"{f['readout_ms_err']}) ms   (R2 {r2:.4f}, {len(pts)} points; limit +- {f['limit_ms_err']} ms)")
