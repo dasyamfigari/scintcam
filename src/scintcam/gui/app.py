@@ -84,7 +84,8 @@ class App:
         self._ae_read = None          # auto exposure on: latest exposure read from the driver (ms), from a thread
         self._ae_next = 0.0
         self._ae_stale = None         # exposure_absolute stored when auto was switched on (many cameras keep reporting it)
-        self._cam_shown = {}          # field -> text last read back from the camera
+        self._cam_shown = {}
+        self.cam_labels = {}          # field -> text last read back from the camera
 
         self._vars()
         self._build_view()
@@ -206,7 +207,9 @@ class App:
         grid.pack(fill="x", pady=(6, 0))
         self.cam_entries = {}
         for i, (key, label) in enumerate(CAM_FIELDS):
-            ttk.Label(grid, text=label).grid(row=i // 3 * 2, column=i % 3, sticky="w", padx=(0, 6))
+            lb = ttk.Label(grid, text=label)
+            lb.grid(row=i // 3 * 2, column=i % 3, sticky="w", padx=(0, 6))
+            self.cam_labels[key] = (lb, label)
             v = tk.StringVar()
             e = ttk.Entry(grid, textvariable=v, width=8)
             e.grid(row=i // 3 * 2 + 1, column=i % 3, sticky="w", padx=(0, 6))
@@ -291,6 +294,7 @@ class App:
         """Worker thread: opening can take seconds (mode ladder); the GUI stays responsive meanwhile."""
         try:
             cap, size, fps = camera.open_camera(self.cfg["camera"])
+            camera.load_profile(self.cfg)
             camera.lock_camera(cap, self.cfg)
             if not self.cfg["camera"]["fps"]:       # rate set by the camera (exposure): measure it AFTER the lock
                 fps = camera.measure_fps(cap, 30) or fps
@@ -615,9 +619,19 @@ class App:
                 var.set("" if "value" not in d else str(d["value"]))
                 self._cam_shown[key] = var.get()
                 have = "value" in d
+                lb, text = self.cam_labels[key]
+                eff = (self._profile_ctl(CAM_V4L2[key]) or {}).get("effect")
+                lb.configure(text=text + (" (no effect)" if eff == "none" else ""),
+                             foreground="#888888" if eff == "none" else "")
             entry.state(["!disabled"] if ((have or not ctr) and not (auto and key == "exposure_ms")) else ["disabled"])
         if auto and not self.cam_entries["exposure_ms"][0].get():
             self.lbl_ae.configure(text="ON: not for measurements; camera does not report its exposure")
+
+    def _profile_ctl(self, name):
+        return ((self.cfg.get("_profile") or {}).get("controls") or {}).get(name)
+
+    def _profile_exp(self):
+        return (self.cfg.get("_profile") or {}).get("exposure") or {}
 
     def _camera_values(self, changed_only=True):
         """Typed values -> {control: value}, checked against the driver's range. Empty field = not changed.
@@ -669,10 +683,16 @@ class App:
         self._cam_busy = True
         self.btn_apply.state(["disabled"])
         log.info("applying camera settings: %s", ", ".join(f"{k}={v}" for k, v in vals.items()))
+        ex = self._profile_exp()
+        if "exposure" in vals and ex.get("full_rate_max_ms") and 0.1 * vals["exposure"] > ex["full_rate_max_ms"]:
+            log.warning("%.1f ms is above %.1f ms: on this camera the frame rate drops (camera profile)",
+                        0.1 * vals["exposure"], ex["full_rate_max_ms"])
+        settle = float(ex.get("settle_s") or 0.5)
 
         def work():        # v4l2-ctl calls and the auto->manual pause take ~0.5 s: off the GUI thread
             try:
                 camera.lock_camera(self.cap, self.cfg)
+                time.sleep(settle)         # until the change shows in the image
             finally:
                 self._cam_done = True
         threading.Thread(target=work, daemon=True).start()
@@ -688,7 +708,8 @@ class App:
                 self._cam_shown["exposure_ms"] = txt
                 self.lbl_ae.configure(text="ON: not for measurements")
         now = time.monotonic()
-        if not self.var_ae.get() or self._cam_busy or self.cap is None or now < self._ae_next:
+        if not self.var_ae.get() or self._cam_busy or self.cap is None or now < self._ae_next \
+                or self._profile_exp().get("auto_readback") == "stale":
             return
         self._ae_next = now + 1.0
         dev = self.cfg["camera"]["device"]
@@ -717,17 +738,75 @@ class App:
             log.warning("auto exposure ON: the camera changes the exposure with the scene brightness, so intensities "
                         "are NOT comparable between frames or clips. Use it only to find a setting, then switch it off.")
         else:
-            log.info("auto exposure OFF: manual again; the camera may return to its stored manual exposure rather "
-                     "than keep the auto one. Type exposure (ms) and Apply to set it")
+            log.info("auto exposure OFF: switching to manual and matching the brightness auto exposure had ...")
         self._cam_busy = True
         self.btn_apply.state(["disabled"])
 
         def work():
             try:
-                camera.lock_camera(self.cap, self.cfg)
+                if want:
+                    camera.lock_camera(self.cap, self.cfg)
+                else:
+                    self._match_auto_level()
+            except Exception:
+                log.exception("auto exposure switch failed")
             finally:
                 self._cam_done = True
         threading.Thread(target=work, daemon=True).start()
+
+    def _level(self, n=8):
+        """Mean level of the next n frames (analysis channel of the raw frame), from the capture thread."""
+        ev, box = threading.Event(), {}
+        self.engine.measure_stability(n, lambda r: (box.update(r=r), ev.set()))
+        ev.wait(15)
+        return (box.get("r") or {}).get("mean")
+
+    def _match_auto_level(self):
+        """Worker: auto -> manual, then set the manual exposure that gives the level auto exposure had.
+
+        Many cameras return to their stored manual exposure on that switch, and do not report the exposure auto
+        used, so the level is matched instead: E_next = E * L_auto / L (level ~ exposure), repeated until
+        |L - L_auto| <= max(2 counts, 3 %)."""
+        cam, ex = self.cfg["camera"], self._profile_exp()
+        settle = float(ex.get("settle_s") or 1.0)
+        target = self._level(10)
+        camera.lock_camera(self.cap, self.cfg)          # auto_exposure = false, no exposure: plain switch
+        time.sleep(settle)
+        lv = self._level(8)
+        if target is None or lv is None or not camera.have_v4l2ctl():
+            return
+        ctr = camera.v4l2_controls(cam["device"]) or {}
+        name = next((n for n in camera.CONTROL_MAP["exposure"][0] if n in ctr), None)
+        if name is None or ex.get("apply") == "none":
+            log.warning("auto exposure OFF: level %.1f (auto gave %.1f); the exposure cannot be set on this camera",
+                        lv, target)
+            return
+        d = ctr[name]
+        e, lo, hi = d.get("value"), d.get("min", 1), d.get("max", 100000)
+        tol = max(2.0, 0.03 * target)
+        strategy = camera.exposure_strategy(self.cfg)
+        changed = False
+        for _ in range(6):
+            if abs(lv - target) <= tol or not isinstance(e, int):
+                break
+            new = e / 2 if lv >= 250 else (e * 4 if lv < 1 else e * target / lv)
+            new = int(min(max(round(new), lo), hi))
+            if new == e:
+                break
+            e, changed = new, True
+            camera.apply_exposure(cam["device"], e, strategy, cam["exposure_cycle_delay_s"])
+            time.sleep(settle)
+            lv = self._level(8)
+            if lv is None:
+                return
+        if changed:
+            cam["controls"]["exposure"] = e
+        log.info("auto exposure OFF: manual %s, level %.1f (auto gave %.1f)",
+                 f"{0.1 * e:g} ms" if isinstance(e, int) else "exposure", lv, target)
+        if abs(lv - target) > tol:
+            log.warning("could not match the auto brightness within 3 %%: set exposure (ms) by hand")
+        if isinstance(e, int) and ex.get("full_rate_max_ms") and 0.1 * e > ex["full_rate_max_ms"]:
+            log.warning("%.1f ms is above %.1f ms: on this camera the frame rate drops", 0.1 * e, ex["full_rate_max_ms"])
 
     def save_camera(self):
         path = self.cfg.get("_path")

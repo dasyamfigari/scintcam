@@ -10,6 +10,7 @@ here and the state actually in use is read back from the driver and logged with 
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import os
 import shutil
@@ -72,13 +73,32 @@ def v4l2_query(dev, args: List[str]) -> Optional[str]:
     return p.stdout if p.returncode == 0 else None
 
 
-def v4l2_set(dev, name: str, value) -> bool:
+def v4l2_set_msg(dev, name: str, value) -> Tuple[bool, str]:
+    """Write one control; (accepted, driver message). Accepted only means the driver took the number."""
     try:
         p = subprocess.run(["v4l2-ctl", "-d", v4l2_device(dev), "-c", f"{name}={value}"],
                            capture_output=True, text=True, timeout=5)
-    except Exception:
-        return False
-    return p.returncode == 0 and not p.stderr.strip()
+    except Exception as e:
+        return False, str(e)
+    msg = (p.stderr or "").strip()
+    return p.returncode == 0 and not msg, msg
+
+
+def v4l2_set(dev, name: str, value) -> bool:
+    return v4l2_set_msg(dev, name, value)[0]
+
+
+def v4l2_get(dev, name: str) -> Optional[int]:
+    """Value the driver reports for one control (v4l2-ctl -C); None if it cannot be read."""
+    txt = v4l2_query(dev, ["-C", name])
+    for line in (txt or "").splitlines():
+        k, sep, v = line.partition(":")
+        if sep and k.strip() == name:
+            try:
+                return int(v.strip())
+            except ValueError:
+                return None
+    return None
 
 
 def v4l2_controls(dev) -> Optional[Dict[str, Dict[str, Any]]]:
@@ -92,7 +112,7 @@ def v4l2_controls(dev) -> Optional[Dict[str, Dict[str, Any]]]:
         parts = head.split()
         if not sep or len(parts) < 2 or not parts[1].startswith("0x"):   # section titles, menu items
             continue
-        d = {}
+        d = {"type": parts[2].strip("()")} if len(parts) > 2 and parts[2].startswith("(") else {}
         for kv in rest.split():
             if "=" in kv:
                 k, v = kv.split("=", 1)
@@ -133,6 +153,57 @@ def v4l2_format(dev) -> Optional[Dict[str, Any]]:
         elif k == "Pixel Format":
             out["pixel_format"] = v.split()[0].strip("'")
     return out
+
+
+def device_info(dev) -> Dict[str, str]:
+    """Identity of the device from v4l2-ctl --info: driver, card, bus_info, driver_version (+ USB id from sysfs)."""
+    out: Dict[str, str] = {}
+    keys = {"Driver name": "driver", "Card type": "card", "Bus info": "bus_info", "Driver version": "driver_version"}
+    for line in (v4l2_query(dev, ["--info"]) or "").splitlines():
+        k, sep, v = (x.strip() for x in line.partition(":"))
+        if sep and k in keys and keys[k] not in out:
+            out[keys[k]] = v
+    node = os.path.basename(v4l2_device(dev))
+    for up in ("../idVendor", "../../idVendor"):          # /sys/class/video4linux/videoN/device -> USB interface
+        f = os.path.join("/sys/class/video4linux", node, "device", up)
+        try:
+            vid = open(f).read().strip()
+            pid = open(f.replace("idVendor", "idProduct")).read().strip()
+            out["usb_id"] = f"{vid}:{pid}"
+            break
+        except OSError:
+            continue
+    return out
+
+
+def load_profile(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Read the camera profile written by `scintcam diagnose` into cfg["_profile"] (None if absent or for another
+    camera). Without a profile scintcam uses the methods that work on most cameras."""
+    cfg["_profile"] = None
+    path = cfg["camera"].get("profile") or ""
+    if not path:
+        return None
+    if not os.path.exists(path):
+        log.info("no camera profile (%s): run `scintcam diagnose` once to test what this camera really does", path)
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            prof = json.load(f)
+    except (OSError, ValueError) as e:
+        log.warning("camera profile %s unreadable (%s): ignored", path, e)
+        return None
+    card = (prof.get("device") or {}).get("card")
+    cur = device_info(cfg["camera"]["device"]).get("card") if have_v4l2ctl() else None
+    if card and cur and card != cur:
+        log.warning("camera profile %s was made for '%s' but this device is '%s': ignored (run scintcam diagnose)",
+                    path, card, cur)
+        return None
+    ex = prof.get("exposure") or {}
+    log.info("camera profile %s (%s, %s): exposure applied by '%s', auto value %s, manual after auto %s",
+             path, card or "?", (prof.get("created") or "")[:10], ex.get("apply", "?"),
+             ex.get("auto_readback", "?"), ex.get("manual_after_auto", "?"))
+    cfg["_profile"] = prof
+    return prof
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -261,37 +332,70 @@ def lock_camera(cap, cfg: Dict[str, Any]) -> None:
     use_v4l2 = have_v4l2ctl() if cam["use_v4l2ctl"] == "auto" else bool(cam["use_v4l2ctl"])
     done = set()
     if use_v4l2:
-        done = _lock_v4l2(cam, ctl)
+        done = _lock_v4l2(cam, ctl, exposure_strategy(cfg))
     elif IS_LINUX:
         log.warning("v4l2-ctl not found (install v4l-utils): controls set through OpenCV only, less reliable")
     _lock_opencv(cap, ctl, skip=done)
 
 
-def _lock_v4l2(cam: Dict[str, Any], ctl: Dict[str, Any]) -> set:
+EXPOSURE_STRATEGIES = ("direct", "store_then_cycle", "write_in_auto", "full_sequence")
+
+
+def apply_exposure(dev, value: int, strategy: str = "full_sequence", delay_s: float = 0.35) -> None:
+    """Put a manual exposure into effect (value in UVC units of 100 us), by the method the camera needs.
+
+    direct            write the value in manual mode (cameras that apply manual writes at once)
+    store_then_cycle  write it (stored, not used), then a short auto -> manual transition, which latches the STORED
+                      value (cameras that apply a manual exposure only on that transition)
+    write_in_auto     switch to auto, write the value there, switch to manual
+    full_sequence     auto, wait, manual, write, short auto -> manual, write again: works on all three kinds above,
+                      used when no camera profile says which kind this camera is
+    `scintcam diagnose` finds the method by watching the image; reading the value back proves nothing.
+    """
+    auto = lambda v: any(v4l2_set(dev, n, v) for n in CONTROL_MAP["auto_exposure"][0])
+    expo = lambda: any(v4l2_set(dev, n, int(value)) for n in CONTROL_MAP["exposure"][0])
+    if strategy == "direct":
+        auto(1)
+        expo()
+    elif strategy == "store_then_cycle":
+        auto(1)
+        expo()
+        auto(3)
+        time.sleep(0.1)
+        auto(1)
+    elif strategy == "write_in_auto":
+        auto(3)
+        expo()
+        auto(1)
+    else:
+        auto(3)
+        time.sleep(float(delay_s))
+        auto(1)
+        expo()
+        auto(3)
+        time.sleep(0.1)
+        auto(1)
+        time.sleep(0.1)
+        expo()
+
+
+def exposure_strategy(cfg: Dict[str, Any]) -> str:
+    """From the camera profile when there is one, otherwise the safe full sequence (or direct if cycling is off)."""
+    prof = cfg.get("_profile") or {}
+    st = (prof.get("exposure") or {}).get("apply")
+    if st in EXPOSURE_STRATEGIES:
+        return st
+    return "full_sequence" if cfg["camera"]["exposure_cycle"] else "direct"
+
+
+def _lock_v4l2(cam: Dict[str, Any], ctl: Dict[str, Any], strategy: str = "full_sequence") -> set:
     dev = cam["device"]
     manual_exposure = ctl.get("auto_exposure") is False and ctl.get("exposure") is not None
-    if manual_exposure and cam["exposure_cycle"]:
-        # Many UVC cameras latch a manual exposure only on the auto -> manual transition: writing it while already
-        # in manual stores the number (it reads back fine) but the sensor keeps the old integration time, so a
-        # single "auto, manual, value" applies the PREVIOUS value. Sequence: auto, manual, store the value, then a
-        # second short auto -> manual transition that latches it. Cameras that apply manual writes directly end
-        # with the value too (it is written again below).
-        names = CONTROL_MAP["auto_exposure"][0]
-        exp_names = CONTROL_MAP["exposure"][0]
-        mode = lambda v: any(v4l2_set(dev, n, v) for n in names)
-        mode(3)
-        time.sleep(float(cam["exposure_cycle_delay_s"]))
-        mode(1)
-        any(v4l2_set(dev, n, _v4l2_value("exposure", ctl["exposure"])) for n in exp_names)
-        mode(3)
-        time.sleep(0.1)
-        mode(1)
-        time.sleep(0.1)
     applied, failed, done = [], [], set()
     order = [k for k in SWITCHES if k in ctl] + [k for k in ctl if k not in SWITCHES]
     for key in order:
-        if key == "exposure" and ctl.get("auto_exposure") is True:      # ignored (inactive) while auto is on
-            continue
+        if key == "exposure" and (ctl.get("auto_exposure") is True or manual_exposure):
+            continue              # auto: ignored (inactive); manual: written by apply_exposure below
         names = CONTROL_MAP[key][0] if key in CONTROL_MAP else [key]   # unknown keys: raw V4L2 control names
         val = _v4l2_value(key, ctl[key])
         if any(v4l2_set(dev, n, val) for n in names):
@@ -299,6 +403,10 @@ def _lock_v4l2(cam: Dict[str, Any], ctl: Dict[str, Any]) -> set:
             done.add(key)
         else:
             failed.append(key)
+    if manual_exposure:
+        apply_exposure(dev, _v4l2_value("exposure", ctl["exposure"]), strategy, cam["exposure_cycle_delay_s"])
+        applied.append(f"exposure={ctl['exposure']} ({strategy})")
+        done.add("exposure")
     if applied:
         log.info("camera controls set: %s", ", ".join(applied))
     if failed:
@@ -370,6 +478,11 @@ def snapshot(cfg: Dict[str, Any], cap=None) -> Dict[str, Any]:
             summ["gain"] = ctr["gain"]["value"]
     snap["summary"] = summ
     snap["requested"] = cfg_controls(cfg) if cfg["camera"]["lock"] else None
+    prof = cfg.get("_profile")
+    if prof:
+        snap["profile"] = {"file": cfg["camera"].get("profile"), "created": prof.get("created"),
+                           "card": (prof.get("device") or {}).get("card"),
+                           "exposure_apply": (prof.get("exposure") or {}).get("apply")}
     return snap
 
 

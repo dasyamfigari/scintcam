@@ -13,7 +13,8 @@ fallback = true               # if the requested mode delivers no frames, try st
 open_timeout_s = 4.0          # wait for a first frame per mode tried
 lock = true                   # pin automatic exposure, gain, white balance and focus (needed for measurements)
 use_v4l2ctl = "auto"          # Linux: set and read controls with v4l2-ctl ("auto" | true | false)
-exposure_cycle = true         # switch auto -> manual before writing a manual exposure (some UVC cameras only latch it then)
+profile = "camera_profile.json"  # written by `scintcam diagnose`: how this camera applies exposure etc. ("" = none)
+exposure_cycle = true         # without a profile: write exposure with the full auto/manual sequence (safe on most cameras)
 exposure_cycle_delay_s = 0.35
 stability_check = true        # measure the level drift on a static scene after start-up
 stability_frames = 40

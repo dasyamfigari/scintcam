@@ -1,4 +1,4 @@
-"""Command line:  scintcam [--config FILE]  |  scintcam probe [--config FILE]  |  scintcam --print-config"""
+"""Command line:  scintcam [--config FILE]  |  scintcam probe|diagnose [--config FILE]  |  scintcam --print-config"""
 from __future__ import annotations
 
 import argparse
@@ -27,8 +27,10 @@ def _logging(log_dir: str = "") -> None:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="scintcam", description="Live rectified view and recording of a square target "
                                                              "(e.g. a scintillator screen) seen by a webcam.")
-    p.add_argument("command", nargs="?", default="gui", choices=["gui", "probe"],
-                   help="gui (default) or probe: list the modes the camera really streams")
+    p.add_argument("command", nargs="?", default="gui", choices=["gui", "probe", "diagnose"],
+                   help="gui (default); probe: list the modes the camera really streams; diagnose: test what each "
+                        "camera control really does and write the camera profile")
+    p.add_argument("-o", "--output", default="", help="diagnose: profile file (default: camera.profile)")
     p.add_argument("-c", "--config", help="TOML file with the settings that differ from the defaults")
     p.add_argument("--print-config", action="store_true", help="print the full default configuration and exit")
     p.add_argument("--version", action="version", version=f"scintcam {__version__}")
@@ -45,6 +47,9 @@ def main(argv=None) -> int:
         from .camera import probe
         print(probe(cfg["camera"]))
         return 0
+    if a.command == "diagnose":
+        from .diagnose import run as diagnose
+        return diagnose(cfg, a.output)
     if not cfg["rectify"]["target_mm"] or cfg["rectify"]["target_mm"] <= 0:
         print("config error: set rectify.target_mm (side of the square target in mm) in your config file",
               file=sys.stderr)

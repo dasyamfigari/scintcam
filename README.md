@@ -44,6 +44,7 @@ scintcam --print-config > my_setup.toml     # full list of settings, all comment
 #   [rectify]
 #   target_mm = 32.5
 scintcam probe -c my_setup.toml             # which camera modes really stream
+scintcam diagnose -c my_setup.toml          # once per camera: what each control really does (~3 min, lights on)
 scintcam -c my_setup.toml
 ```
 
@@ -60,9 +61,30 @@ scintcam -c my_setup.toml
    `[camera.controls]` of the config file (other lines and comments are kept). Apply is disabled while recording.
    The **auto exposure** box switches the camera's automatic exposure on (orange warning: intensities are not
    comparable between frames or clips) or off. While it is on, the field shows the exposure the camera is choosing,
-   read about once a second, but only if the camera reports it: many keep reporting the stored manual value, and then
-   the field stays empty. Switching it off, such cameras go back to their stored manual exposure, not the auto one.
-   Starting a recording with it on logs a warning.
+   read about once a second, but only if the camera reports it (many keep reporting the stored manual value; the
+   camera profile says which). Switching it off keeps the brightness auto exposure had: scintcam switches to manual,
+   compares the level with the one in auto and adjusts the manual exposure until they agree within 3 %. Starting a
+   recording with it on logs a warning. Controls the diagnosis found without effect are greyed "(no effect)".
+
+## Camera diagnosis and profile
+
+Webcams differ in how they take a setting, and reading a control back proves nothing (the driver caches what was
+written; the firmware may report a stored number while it uses another). `scintcam diagnose` therefore tests every
+control **by the image** with the stream running, and writes `camera_profile.json` (read by scintcam at start,
+`camera.profile`) plus a readable `camera_profile.txt`. Run it once per camera, with scintcam closed, the room lights
+on and a static, unsaturated scene; it takes about 3 minutes and restores the camera settings at the end.
+
+| Test | What is measured | Used by scintcam for |
+|---|---|---|
+| exposure method | level after writing a new exposure in manual (*direct*), after a short auto → manual switch (*store_then_cycle*), after writing it in auto (*write_in_auto*) | applying an exposure on the first try |
+| latency | time from the command to the new level in the image | waiting before reading back |
+| auto exposure | level and read-back in auto; level after auto → manual | whether to show the auto value; matching on switch-off |
+| exposure scan | level, saturated fraction and delivered frame rate for 10 exposures; frame-rate limit by bisection; fit level = a + b·exposure | warning when an exposure slows the camera; linearity (R², power) |
+| other controls | each integer control moved by ¼ of its range: change of level and colour, read-back, out-of-range write (clamped / error / accepted), reversibility | marking controls without effect |
+| reopen | level and mode after closing and reopening the stream | knowing whether settings survive a restart |
+
+Without a profile scintcam uses the method that works on all three kinds of camera (`full_sequence`: auto, manual,
+write, short auto → manual, write again). A profile made for another camera (different card name) is ignored.
 
 ![Corner picker after auto-detection, with the loupe](docs/picker.png)
 
@@ -133,11 +155,12 @@ move it, Enter preview/accept, Esc back/cancel.
 - **Rectification** composes the radial correction and the homography into one lookup map, so each frame is
   interpolated once. Radial distortion is fitted from lines picked on straight edges; short edges near the image
   centre cannot constrain it, use long edges far from the centre.
-- **Exposure.** UVC exposure is in units of 100 µs (400 = 40 ms) and must fit in one frame period (1/fps). Many UVC
-  cameras only apply a manual exposure on the auto → manual transition, and use the value stored at that moment;
-  with `camera.exposure_cycle` the value is stored first and the switch is made for you, and the driver frame rate is checked to confirm the value was applied. If you set exposure by another
-  procedure, leave `exposure` out of `[camera.controls]`: it is then not touched, and the value in use is logged.
-  Values out of the driver's range are refused in the Camera panel, with the range in the log.
+- **Exposure.** UVC exposure is in units of 100 µs (400 = 40 ms). Longer than one frame period (1/fps), the camera
+  slows down; the profile gives the exact limit. Many UVC cameras only apply a manual exposure on the auto → manual
+  transition, and use the value stored at that moment; the camera profile says how this camera takes it, and without
+  a profile the full sequence is used. If you set exposure by another procedure, leave `exposure` out of
+  `[camera.controls]`: it is then not touched. Values out of the driver's declared range are refused in the Camera
+  panel. The level is only proportional to light if gamma is neutral: the diagnosis reports the fit R² and power.
 
 ## Troubleshooting
 
@@ -145,8 +168,8 @@ move it, Enter preview/accept, Esc back/cancel.
   as 480x480 are the usual cause). `scintcam probe` lists the modes that really deliver frames; `camera.fallback`
   switches to one automatically. If it persists, the USB link or the camera is the problem (try another port; on
   Linux USB autosuspend is a common cause).
-- **Exposure reads back correctly but nothing changes:** in auto mode `v4l2-ctl -l` shows `flags=inactive` on
-  `exposure_absolute`; the value is stored but unused. See *Exposure* above.
+- **Exposure reads back correctly but nothing changes, or the image goes dark until Apply is pressed again:** the
+  camera only stores the number; run `scintcam diagnose` so scintcam uses the method this camera needs.
 - **"camera controls changed during the recording":** something else (another program, a camera app) touched the
   camera; the clip's intensities are not comparable across that change.
 - **"the encoder fell behind":** the disk or CPU could not keep up; frames may have been dropped by the driver. Use
