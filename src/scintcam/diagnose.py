@@ -154,7 +154,7 @@ class Diagnosis:
         self.say(f"device   {info.get('card', '?')}  ({info.get('driver', '?')} {info.get('driver_version', '')}, "
                  f"usb {info.get('usb_id', '?')}, kernel {platform.release()})")
         self.say(f"format   {fmt.get('pixel_format', '?')} {fmt.get('width', '?')}x{fmt.get('height', '?')}, "
-                 f"{self.fps:.1f} fps nominal")
+                 f"{self.fps:.1f} fps when opened (before any setting)")
 
     def pin_automatics(self) -> None:
         """White balance and focus automatics off for the whole test (they would move the colour and the level)."""
@@ -349,12 +349,17 @@ class Diagnosis:
             y = np.array([p[1] for p in pts]) / SCALE
             u, dd = np.polyfit(x, y, 1)
             r2 = 1 - ((y - (u * x + dd)) ** 2).sum() / max(((y - y.mean()) ** 2).sum(), 1e-18)
+            u, dd = float(u), float(dd)
             r["unit_fit"] = {"points": len(pts), "unit_us": round(u * 1e6, 4), "readout_ms": round(dd * 1e3, 3),
                              "r2": round(float(r2), 5)}
             self.say(f"frame period = {u * 1e6:.4f} us x exposure + {dd * 1e3:.2f} ms   (R2 {r2:.4f}, {len(pts)} points)")
             if u > 0 and r2 > 0.98:
                 unit, src = u * 1e3, "measured from the frame rate"
                 r["unit_ms_measured"] = round(unit, 7)
+                # longest exposure that still fits the full-rate frame: E_lim = (T_frame - d) / u, with T_frame = 1/f0
+                lim = int((1.0 / f0 / SCALE - dd) / u)
+                if a_ is not None and b_ is not None and 0.8 * a_ <= lim <= b_:
+                    a_ = lim
         r["unit_ms"], r["unit_source"] = round(unit, 7), src
         for x in rows:
             x["ms"] = round(x["exposure"] * unit, 3)
@@ -545,7 +550,8 @@ def report_text(p: Dict[str, Any]) -> str:
          f"device  {d.get('card', '?')}  driver {d.get('driver', '?')} {d.get('driver_version', '')}  "
          f"usb {d.get('usb_id', '?')}  bus {d.get('bus_info', '?')}  kernel {d.get('kernel', '?')}",
          f"format  {d.get('format', {}).get('pixel_format', '?')} {d.get('format', {}).get('width', '?')}x"
-         f"{d.get('format', {}).get('height', '?')}  {d.get('fps_nominal', '?')} fps", ""]
+         f"{d.get('format', {}).get('height', '?')}  {d.get('fps_nominal', '?')} fps when opened, "
+         f"{(p.get('exposure') or {}).get('fps_full', '?')} fps at short exposure", ""]
     sc = p.get("scene") or {}
     L.append(f"scene   level {sc.get('level')}  noise {sc.get('noise')}  effect threshold {sc.get('effect_threshold')} counts")
     L += ["", "FINDINGS"] + [f"  - {f}" for f in p.get("findings", [])] + ["", "EXPOSURE"]
