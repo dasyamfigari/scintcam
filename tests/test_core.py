@@ -145,3 +145,27 @@ def test_save_controls_edits_only_camera_controls(tmp_path):
     assert cfg["camera"]["controls"]["gain"] == 10 and cfg["camera"]["controls"]["exposure"] == 200
     assert cfg["camera"]["controls"]["auto_exposure"] is False and cfg["rectify"]["target_mm"] == 32.5
     assert "# keep me" in txt and txt.count("\nexposure =") == 1
+
+
+def test_exposure_ladder_and_rung():
+    from scintcam import camera as C
+    cfg = load_config(None)
+    ctr = {"exposure_absolute": {"min": 80, "max": 100000, "value": 240}}
+    assert C.exposure_ladder(cfg, ctr) == [80, 240, 720, 2160, 6480, 19440, 58320]   # declared max without profile
+    cfg["_profile"] = {"exposure": {"full_rate_max": 32860}}                     # stop at the full-frame-rate limit
+    lad = C.exposure_ladder(cfg, ctr)
+    assert lad == [80, 240, 720, 2160, 6480, 19440]
+    assert C.exposure_rung(lad, 2160) == 4 and C.exposure_rung(lad, 2161) is None and C.exposure_rung(lad, None) is None
+    cfg["camera"]["exposure_ladder"] = [500, 100, 300]                              # fixed list wins, sorted
+    assert C.exposure_ladder(cfg, ctr) == [100, 300, 500]
+    cfg["camera"]["exposure_ladder"], cfg["camera"]["exposure_ladder_factor"] = [], 1.0
+    assert C.exposure_ladder(cfg, ctr) == [] and C.exposure_ladder(load_config(None), {}) == []
+
+
+def test_marker_carries_exposure_rung():
+    from scintcam import camera as C
+    snap = {"controls": {"exposure_absolute": {"value": 720}},
+            "summary": {"exposure_mode": "manual", "exposure_absolute": 720, "exposure_ms": 0.9612,
+                        "exposure_unit_ms": 0.001335, "exposure_ladder": [80, 240, 720], "exposure_rung": 3}}
+    m = C.marker_fields(snap, None, True)
+    assert m["exposure_rung"] == 3 and m["exposure_ladder"] == [80, 240, 720] and m["exposure"] == 720

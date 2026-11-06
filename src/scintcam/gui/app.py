@@ -14,6 +14,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any, Dict, Optional
@@ -36,7 +37,10 @@ CAM_V4L2 = {"gain": "gain", "gamma": "gamma", "brightness": "brightness", "contr
             "saturation": "saturation"}            # field -> V4L2 control name
 AVG_STEPS = (1, 2, 4, 8, 16, 25, 32, 50, 64, 100, 128, 256)
 KEYS = ("space/v record   c/C colormap   m view   g grid   b profiles   h seismograph   e clear seismograph\n"
-        "i readout   +/- averaging   s snapshot   x stability   r re-pick   q quit")
+        "i readout   +/- averaging   [ ] exposure step down/up   s snapshot   x stability   r re-pick   q quit")
+READOUT_ROWS = (("peak", "peak"), ("n_sat", "saturated px"), ("xbar", "centroid x"), ("ybar", "centroid y"),
+                ("fwhm_x", "FWHM x"), ("fwhm_y", "FWHM y"))
+READOUT_FONT_RANGE = (8, 72)    # readout text size limits [pt]
 
 
 class TkLogHandler(logging.Handler):
@@ -87,6 +91,7 @@ class App:
         self._cam_shown = {}
         self.cam_labels = {}          # field -> text last read back from the camera
 
+        self._saved = self._load_state()
         self._vars()
         self._build_view()
         self._build_controls()
@@ -126,7 +131,6 @@ class App:
         r = self.root
         main = ttk.Frame(r, padding=8)
         main.pack(fill="both", expand=True)
-        big = ("TkDefaultFont", max(10, int(self.rc["font_size"])))
         bold = ("TkDefaultFont", max(10, int(self.rc["font_size"])), "bold")
 
         # --- recording ------------------------------------------------------------------------------------------
@@ -156,13 +160,22 @@ class App:
         fr = ttk.LabelFrame(main, text="Beam readout (alignment only)", padding=6)
         fr.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
         self.ro_labels = {}
-        for i, (k, name) in enumerate((("peak", "peak"), ("n_sat", "saturated px"), ("xbar", "centre x"),
-                                       ("ybar", "centre y"), ("fwhm_x", "FWHM x"), ("fwhm_y", "FWHM y"))):
-            ttk.Label(fr, text=name, font=big).grid(row=i, column=0, sticky="w")
-            self.ro_labels[k] = ttk.Label(fr, text="-", font=bold, width=18, anchor="e")
+        size = self._saved.get("readout_font") or int(self.rc["font_size"])
+        size = int(min(max(size, READOUT_FONT_RANGE[0]), READOUT_FONT_RANGE[1]))
+        self.ro_font = tkfont.nametofont("TkDefaultFont").copy()    # the six readout rows only; +/- below resize them
+        self.ro_font.configure(size=size)
+        self.ro_font_b = self.ro_font.copy()
+        self.ro_font_b.configure(weight="bold")
+        for i, (k, name) in enumerate(READOUT_ROWS):
+            ttk.Label(fr, text=name, font=self.ro_font).grid(row=i, column=0, sticky="w")
+            self.ro_labels[k] = ttk.Label(fr, text="-", font=self.ro_font_b, width=18, anchor="e")
             self.ro_labels[k].grid(row=i, column=1, sticky="e")
         row = ttk.Frame(fr)
         row.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(row, text="−", width=2, command=lambda: self.readout_font(-1)).pack(side="right")
+        ttk.Button(row, text="+", width=2, command=lambda: self.readout_font(1)).pack(side="right")
+        self.lbl_rofont = ttk.Label(row, text=f"text {size} pt", foreground="#555")
+        self.lbl_rofont.pack(side="right", padx=(0, 4))
         ttk.Checkbutton(row, text="on [i]", variable=self.v_ro).pack(side="left")
         ttk.Label(row, text="  average").pack(side="left")
         ttk.Combobox(row, textvariable=self.v_avg, values=[str(a) for a in AVG_STEPS], width=4).pack(side="left")
@@ -217,6 +230,15 @@ class App:
             self.cam_entries[key] = (v, e)
         row = ttk.Frame(fr)
         row.pack(fill="x", pady=(6, 0))
+        ttk.Label(row, text="exposure step").pack(side="left")
+        self.btn_rung_dn = ttk.Button(row, text="◀ [", width=4, command=lambda: self.step_rung(-1))
+        self.btn_rung_dn.pack(side="left", padx=(6, 0))
+        self.btn_rung_up = ttk.Button(row, text="] ▶", width=4, command=lambda: self.step_rung(1))
+        self.btn_rung_up.pack(side="left")
+        self.lbl_rung = ttk.Label(row, text="")
+        self.lbl_rung.pack(side="left", padx=(6, 0))
+        row = ttk.Frame(fr)
+        row.pack(fill="x", pady=(6, 0))
         self.var_ae = tk.BooleanVar(value=False)
         self.chk_ae = ttk.Checkbutton(row, text="auto exposure", variable=self.var_ae, command=self.toggle_auto_exposure)
         self.chk_ae.pack(side="left")
@@ -264,7 +286,8 @@ class App:
                 "C": lambda: self.cycle_cmap(-1), "m": self.cycle_view, "g": lambda: self._flip(self.v_grid),
                 "b": lambda: self._flip(self.v_prof), "h": lambda: self._flip(self.v_seis), "e": self.clear_seismo,
                 "i": lambda: self._flip(self.v_ro), "plus": lambda: self._step_avg(1), "equal": lambda: self._step_avg(1),
-                "minus": lambda: self._step_avg(-1), "s": self.snapshot, "x": self.stability, "r": self.repick,
+                "minus": lambda: self._step_avg(-1), "bracketleft": lambda: self.step_rung(-1),
+                "bracketright": lambda: self.step_rung(1), "s": self.snapshot, "x": self.stability, "r": self.repick,
                 "q": self.quit}
         for key, fn in acts.items():
             w.bind(f"<KeyPress-{key}>", lambda e, fn=fn: None if self._typing(e) else (fn(), "break")[1])
@@ -273,15 +296,28 @@ class App:
     def _typing(e) -> bool:
         return e.widget.winfo_class() in ("TEntry", "Entry", "TSpinbox", "Spinbox", "TCombobox", "Text")
 
-    def _restore_geometry(self):
-        g = self.cfg["gui"]
-        saved = {}
-        if g["state_file"] and os.path.exists(g["state_file"]):
+    def _load_state(self) -> Dict[str, Any]:
+        """Window positions and readout text size remembered from the last run (gui.state_file)."""
+        g = self.cfg["gui"]["state_file"]
+        if g and os.path.exists(g):
             try:
-                with open(g["state_file"]) as f:
-                    saved = json.load(f)
+                with open(g) as f:
+                    d = json.load(f)
+                return d if isinstance(d, dict) else {}
             except (OSError, ValueError):
                 pass
+        return {}
+
+    def readout_font(self, step: int):
+        """Text size of the six readout rows (peak, saturated, centroid x/y, FWHM x/y) by `step` points."""
+        size = int(min(max(int(self.ro_font.cget("size")) + step, READOUT_FONT_RANGE[0]), READOUT_FONT_RANGE[1]))
+        self.ro_font.configure(size=size)
+        self.ro_font_b.configure(size=size)
+        self.lbl_rofont.configure(text=f"text {size} pt")
+
+    def _restore_geometry(self):
+        g = self.cfg["gui"]
+        saved = self._saved
         if g["controls_geometry"] or saved.get("controls"):
             self.root.geometry(g["controls_geometry"] or saved["controls"])
         if g["view_geometry"] or saved.get("view"):
@@ -629,6 +665,43 @@ class App:
             entry.state(["!disabled"] if ((have or not ctr) and not (auto and key == "exposure_ms")) else ["disabled"])
         if auto and not self.cam_entries["exposure_ms"][0].get():
             self.lbl_ae.configure(text="ON: not for measurements; camera does not report its exposure")
+        self._fill_rung(summ)
+
+    def _fill_rung(self, summ):
+        """Exposure-ladder line: rung k of N and its exposure, or where an off-ladder exposure lies."""
+        lad = summ.get("exposure_ladder") or []
+        ea = summ.get("exposure_absolute")
+        ok = bool(lad) and summ.get("exposure_mode") is not None
+        for b in (self.btn_rung_dn, self.btn_rung_up):
+            b.state(["!disabled"] if ok else ["disabled"])
+        if not lad:
+            self.lbl_rung.configure(text="(no ladder: no exposure control)", foreground="#888888")
+        elif summ.get("exposure_mode") != "manual" or ea is None:
+            self.lbl_rung.configure(text=f"auto ({len(lad)} rungs; ◀ ▶ = manual)", foreground="#b26a00")
+        elif summ.get("exposure_rung"):
+            self.lbl_rung.configure(text=f"{summ['exposure_rung']} / {len(lad)}   {self._fmt_exp(ea)}", foreground="")
+        else:
+            self.lbl_rung.configure(text=f"off the ladder: {self._fmt_exp(ea)}",
+                                    foreground="#b26a00")
+
+    def step_rung(self, d: int):
+        """Next exposure rung below (d < 0) or above (d > 0) the current exposure; applied at once."""
+        summ = (self.cam_snap or {}).get("summary") or {}
+        lad = summ.get("exposure_ladder") or []
+        if not lad or self.cap is None:
+            return
+        ea = summ.get("exposure_absolute") if summ.get("exposure_mode") == "manual" else None
+        if ea is None:                                   # auto: start from the middle of the ladder
+            tgt = lad[len(lad) // 2]
+        elif d > 0:
+            tgt = next((v for v in lad if v > ea), None)
+        else:
+            tgt = next((v for v in reversed(lad) if v < ea), None)
+        if tgt is None:
+            log.info("exposure already at the %s rung (%s)", "top" if d > 0 else "bottom", self._fmt_exp(ea))
+            return
+        self._apply_values({"auto_exposure": False, "exposure": int(tgt)},
+                           note=f"exposure rung {lad.index(tgt) + 1}/{len(lad)}")
 
     def _profile_ctl(self, name):
         return ((self.cfg.get("_profile") or {}).get("controls") or {}).get(name)
@@ -695,10 +768,20 @@ class App:
         if not vals:
             log.info("nothing changed: edit a field, then Apply")
             return
+        self._apply_values(vals)
+
+    def _apply_values(self, vals: Dict[str, Any], note: str = ""):
+        """Write camera controls in a worker thread (shared by Apply and the exposure-ladder buttons)."""
+        if self.cap is None or self._cam_busy:
+            return
+        if self.engine is not None and self.engine.recorder.active:
+            log.warning("camera settings cannot change during a recording; stop it first")
+            return
         self.cfg["camera"]["controls"].update(vals)   # the next recordings log these as the requested values
         self._cam_busy = True
         self.btn_apply.state(["disabled"])
-        log.info("applying camera settings: %s", ", ".join(f"{k}={v}" for k, v in vals.items()))
+        log.info("applying camera settings%s: %s", f" ({note})" if note else "",
+                 ", ".join(f"{k}={v}" for k, v in vals.items()))
         ex = self._profile_exp()
         if "exposure" in vals and ex.get("full_rate_max") and vals["exposure"] > ex["full_rate_max"]:
             log.warning("%s is above %s: on this camera the frame rate drops (camera profile)",
@@ -886,7 +969,8 @@ class App:
             g = self.cfg["gui"]["state_file"]
             if g:
                 with open(g, "w") as f:
-                    json.dump({"controls": self.root.geometry(), "view": self.view.geometry()}, f)
+                    json.dump({"controls": self.root.geometry(), "view": self.view.geometry(),
+                               "readout_font": int(self.ro_font.cget("size"))}, f)
         except OSError:
             pass
         if self.engine is not None:

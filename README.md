@@ -4,7 +4,7 @@ Live, rectified view and lossless recording of a scintillator screen (or any fla
 webcam, built for beam-profile monitoring at small accelerators.
 
 You pick (or auto-detect) the four corners of the target once; every frame is then mapped to target coordinates in mm
-and shown with the beam profiles, a quick centre/FWHM readout and a rolling trace of the total light. Recording writes
+and shown with the beam profiles, a quick centroid/FWHM readout and a rolling trace of the total light. Recording writes
 the raw and rectified video losslessly, the capture time of every frame, the camera state actually in use and the
 geometry, so the clips can be analysed quantitatively later.
 
@@ -65,6 +65,16 @@ scintcam -c my_setup.toml
    camera profile says which). Switching it off keeps the brightness auto exposure had: scintcam switches to manual,
    compares the level with the one in auto and adjusts the manual exposure until they agree within 3 %. Starting a
    recording with it on logs a warning. Controls the diagnosis found without effect are greyed "(no effect)".
+5. Exposure ladder: **◀ [** and **] ▶** (keys `[` and `]`) move the exposure to the next fixed value below or above,
+   applied at once (from auto they switch to manual on the middle rung). Fixed values make runs reproducible: each
+   clip is on one of a few known exposures, logged as `exposure_rung` in the `.done` marker, and the ratios between
+   rungs can be measured once (steady LED, one short clip per rung) instead of trusting the nominal ms. By default the
+   rungs are E_k = E_min · f^k (E_min the camera's minimum exposure [steps], f = `camera.exposure_ladder_factor`,
+   default 3, k = 0, 1, 2 …) up to the full-frame-rate limit of the camera profile; f = 3 is narrower than a 20–100
+   count peak window, so any beam intensity fits one rung. `camera.exposure_ladder` sets an explicit list [steps]
+   instead. A typed exposure that is not a rung is shown as "off the ladder".
+6. Beam readout text: the **+** / **−** buttons resize the six readout rows (peak, saturated px, centroid x/y, FWHM
+   x/y) for reading from a distance; the size is remembered with the window positions.
 
 ## Camera diagnosis and profile
 
@@ -120,7 +130,7 @@ In `recording.dir`, with `stem` = start time `YYYY-MM-DD-HHMMSS`:
 | `<stem>.mkv`, `<stem>_rect.mkv` | raw and rectified video (`recording.source`), FFV1 lossless |
 | `<stem>_frames.csv` | `frame, t_s, t_driver_ms`: host time of every frame and the driver timestamp |
 | `<stem>_settings.json` | written at start, completed at stop: camera controls read back from the driver at start and stop (exposure in ms, gain, every control, changes during the clip), last stability check, the full rectification (corners, homography, distortion, mm/px, channel) |
-| `<stem>.done` | written **last**, after every other file is closed: the clip is complete. Watchers on other machines can wait for it. `"files"` lists the videos only. It also carries the camera state at the start in flat keys: every V4L2 control by its driver name, `exposure` (camera steps, manual mode only; `exposure_ms` and `exposure_unit_ms` when the profile has the measured unit), `format`, `camera_locked`, `stab_drift_pct`, `stab_rms_pct` |
+| `<stem>.done` | written **last**, after every other file is closed: the clip is complete. Watchers on other machines can wait for it. `"files"` lists the videos only. It also carries the camera state at the start in flat keys: every V4L2 control by its driver name, `exposure` (camera steps, manual mode only; `exposure_ms` and `exposure_unit_ms` when the profile has the measured unit), `exposure_rung` and `exposure_ladder` (rung of the exposure ladder, null if off it), `format`, `camera_locked`, `stab_drift_pct`, `stab_rms_pct` |
 | `rectify_points.json` | geometry of each raw clip under its file name, schema of `beamview.write_rectification` (offline tools need no re-picking) |
 
 A crash writes no `.done`, so an incomplete clip is never picked up automatically.
@@ -143,6 +153,7 @@ Placeholders: `{raw} {rect} {settings} {timestamps} {stem} {dir}`. Output goes t
 | b | profile strips | h | total-light trace |
 | e | clear the trace | i | readout on/off |
 | + / - | averaging window | s | PNG snapshot |
+| [ / ] | exposure ladder: rung down / up | | |
 | x | stability check | r | re-pick corners |
 | q | quit | | |
 
@@ -151,7 +162,8 @@ move it, Enter preview/accept, Esc back/cancel.
 
 ## Measurement notes
 
-- **Readout is for alignment.** Centre and FWHM come from the row and column through the peak after a percentile
+- **Readout is for alignment.** The position shown as *centroid* is the peak position (smoothed maximum, or the
+  middle of a saturated plateau), not an intensity-weighted mean; it and the FWHM come from the row and column through the peak after a percentile
   background; they are not fitted sizes. With saturated pixels the FWHM is over-estimated (the half level is taken
   from the clip level): keep *saturated px* at 0. Averaging N **frames** reduces the noise bias of the width;
   averaging N **values** only shows the scatter of independent estimates. Both average over N/fps seconds, so they

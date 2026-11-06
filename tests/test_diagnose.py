@@ -74,6 +74,8 @@ def test_profile_sets_exposure_strategy(fakecam, tmp_path):
     cfg["camera"]["controls"].update(auto_exposure=False, exposure=420)
     C.lock_camera(None, cfg)
     assert json.loads(fakecam.read_text())["active"] == 420  # in effect on the first application
+    snap = C.snapshot(cfg)                                    # ladder from the declared minimum (3) x 3
+    assert snap["summary"]["exposure_ladder"][:3] == [3, 9, 27] and snap["summary"]["exposure_rung"] is None
     (tmp_path / "p.json").write_text(json.dumps({"device": {"card": "Another camera"}, "exposure": {"apply": "direct"}}))
     assert C.load_profile(cfg) is None and C.exposure_strategy(cfg) == "full_sequence"
 

@@ -16,6 +16,9 @@ use_v4l2ctl = "auto"          # Linux: set and read controls with v4l2-ctl ("aut
 profile = "camera_profile.json"  # written by `scintcam diagnose`: how this camera applies exposure etc. ("" = none)
 exposure_cycle = true         # without a profile: write exposure with the full auto/manual sequence (safe on most cameras)
 exposure_cycle_delay_s = 0.35
+exposure_ladder = []          # fixed exposures [camera steps] for the ◀ ▶ buttons, e.g. [80, 240, 720, 2160, 6480, 19440];
+                              # [] = from the camera's minimum, x exposure_ladder_factor, up to the full-frame-rate limit
+exposure_ladder_factor = 3.0  # ratio between rungs when the ladder is automatic (<= 1: no ladder)
 stability_check = true        # measure the level drift on a static scene after start-up
 stability_frames = 40
 
@@ -27,7 +30,8 @@ auto_wb = false
 autofocus = false
 sharpness = 0                 # edge enhancement changes beam edges
 backlight = 0                 # backlight compensation is a hidden automatic gain
-# exposure = 400              # UVC unit = 100 us, so 400 = 40 ms; must fit in one frame period (1/fps)
+# exposure = 400              # camera steps; the duration of one step is measured by `scintcam diagnose`
+                              # (UVC standard 100 us, but the DV20 webcam uses ~1.3 us); must fit in one frame period
 # gain = 4
 # power_line_frequency = 1    # 1 = 50 Hz, 2 = 60 Hz (anti-flicker for room lights)
 
@@ -87,7 +91,8 @@ avg_mode = "frames"
 every = 1                     # instantaneous mode: compute every N displayed frames
 decimals_pos = 2
 decimals_fwhm = 2
-font_size = 12                # readout font size in the controls window [pt]
+font_size = 12                # starting text size of the readout rows [pt]; the + / − buttons change it and the
+                              # last size is remembered in gui.state_file
 
 [seismograph]
 enabled = true

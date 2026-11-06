@@ -412,6 +412,44 @@ def exposure_text(cfg: Dict[str, Any], steps) -> str:
     return f"{u * steps:.4g} ms ({steps} steps)" if u else f"{steps} steps (unit not measured)"
 
 
+def exposure_ladder(cfg: Dict[str, Any], ctr: Optional[Dict[str, Any]] = None) -> List[int]:
+    """Fixed exposures [camera steps] for reproducible settings: camera.exposure_ladder if set, otherwise
+
+        E_k = round(E_min * f^k),  k = 0, 1, 2, ...  while E_k <= E_max
+
+    E_min  smallest exposure the driver accepts (declared minimum of exposure_absolute) [steps]
+    f      camera.exposure_ladder_factor (default 3: smaller than the 20-100 ADC peak window, so any beam intensity
+           fits one rung)
+    E_max  largest exposure at the full frame rate (camera profile, full_rate_max), else the declared maximum [steps]
+    Empty when the camera has no exposure control or the factor is <= 1."""
+    cam = cfg["camera"]
+    fixed = [int(v) for v in (cam.get("exposure_ladder") or []) if isinstance(v, (int, float)) and v > 0]
+    if fixed:
+        return sorted(set(fixed))
+    f = float(cam.get("exposure_ladder_factor") or 0)
+    ctr = ctr or {}
+    d = ctr.get("exposure_absolute") or ctr.get("exposure_time_absolute") or {}
+    lo = d.get("min")
+    if f <= 1 or not isinstance(lo, int):
+        return []
+    hi = ((cfg.get("_profile") or {}).get("exposure") or {}).get("full_rate_max") or d.get("max")
+    if not isinstance(hi, (int, float)):
+        return []
+    out, e = [], float(max(lo, 1))
+    while round(e) <= hi:
+        out.append(int(round(e)))
+        e *= f
+    return out
+
+
+def exposure_rung(ladder: List[int], steps) -> Optional[int]:
+    """1-based rung of `steps` on the ladder, None if it is not exactly one of the rungs."""
+    try:
+        return ladder.index(int(steps)) + 1 if steps is not None else None
+    except ValueError:
+        return None
+
+
 def exposure_strategy(cfg: Dict[str, Any]) -> str:
     """From the camera profile when there is one, otherwise the safe full sequence (or direct if cycling is off)."""
     prof = cfg.get("_profile") or {}
@@ -513,6 +551,11 @@ def snapshot(cfg: Dict[str, Any], cap=None) -> Dict[str, Any]:
                 summ["exposure_ms"] = u * ea["value"] if u else None
         if isinstance(ctr.get("gain", {}).get("value"), int):
             summ["gain"] = ctr["gain"]["value"]
+        lad = exposure_ladder(cfg, ctr)
+        if lad:
+            summ["exposure_ladder"] = lad
+            summ["exposure_rung"] = (exposure_rung(lad, summ["exposure_absolute"])
+                                     if summ["exposure_mode"] == "manual" else None)
     snap["summary"] = summ
     snap["requested"] = cfg_controls(cfg) if cfg["camera"]["lock"] else None
     prof = cfg.get("_profile")
@@ -532,6 +575,9 @@ def marker_fields(snap: Optional[dict], stab: Optional[dict], locked: bool) -> D
       exposure_ms     = exposure x exposure_unit_ms: integration time [ms]
       exposure_unit_ms = duration of one exposure unit [ms], measured by scintcam diagnose (camera profile); both keys
                         are absent without a profile (the UVC standard 0.1 ms is not assumed)
+      exposure_rung   = 1-based rung of the exposure ladder (exposure_ladder) the clip was recorded on, None if the
+                        exposure is not one of the rungs; only in manual mode
+      exposure_ladder = the ladder [camera steps], so the rung can be checked later
       format          = "<pixel format> <width>x<height>" streamed by the driver
       camera_locked   = whether scintcam pinned the controls (camera.lock)
       stab_drift_pct, stab_rms_pct = last stability check, only when it could judge (lit scene)
@@ -547,6 +593,9 @@ def marker_fields(snap: Optional[dict], stab: Optional[dict], locked: bool) -> D
         if summ.get("exposure_ms") is not None:
             out["exposure_ms"] = round(summ["exposure_ms"], 4)
             out["exposure_unit_ms"] = summ["exposure_unit_ms"]
+        if summ.get("exposure_ladder"):
+            out["exposure_rung"] = summ.get("exposure_rung")
+            out["exposure_ladder"] = list(summ["exposure_ladder"])
     fmt = (snap or {}).get("format") or {}
     if fmt.get("pixel_format") and fmt.get("width"):
         out["format"] = f"{fmt['pixel_format']} {fmt['width']}x{fmt['height']}"
