@@ -183,8 +183,12 @@ def load_profile(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     path = cfg["camera"].get("profile") or ""
     if not path:
         return None
+    if not os.path.isabs(path):      # next to the config file first, then the folder scintcam was started from
+        cands = ([os.path.join(os.path.dirname(cfg["_path"]), path)] if cfg.get("_path") else []) + [path]
+        path = next((c for c in cands if os.path.exists(c)), path)
     if not os.path.exists(path):
-        log.info("no camera profile (%s): run `scintcam diagnose` once to test what this camera really does", path)
+        log.warning("no camera profile (%s, looked next to the config and in %s): exposures are shown in camera "
+                    "steps; run `scintcam diagnose` once to measure the unit", path, os.getcwd())
         return None
     try:
         with open(path, encoding="utf-8") as f:
@@ -382,11 +386,18 @@ def apply_exposure(dev, value: int, strategy: str = "full_sequence", delay_s: fl
 UVC_UNIT_MS = 0.1        # UVC standard exposure_absolute unit (100 us); not all cameras follow it
 
 
-def exposure_unit_ms(cfg: Dict[str, Any]) -> float:
-    """Duration of one exposure_absolute step [ms]: measured by `scintcam diagnose` (from the frame rate) when the
-    profile has it, otherwise the UVC standard 0.1 ms."""
+def exposure_unit_ms(cfg: Dict[str, Any]) -> Optional[float]:
+    """Duration of one exposure_absolute step [ms], measured by `scintcam diagnose` (from the frame rate); None
+    without a profile that has it: the UVC standard 0.1 ms is NOT assumed (the DV20 webcam uses ~1.32 us), so
+    exposures are then shown and logged in camera steps only."""
     u = ((cfg.get("_profile") or {}).get("exposure") or {}).get("unit_ms_measured")
-    return float(u) if isinstance(u, (int, float)) and u > 0 else UVC_UNIT_MS
+    return float(u) if isinstance(u, (int, float)) and u > 0 else None
+
+
+def exposure_text(cfg: Dict[str, Any], steps) -> str:
+    """'<ms> ms (<steps> steps)' with a measured unit, '<steps> steps' without."""
+    u = exposure_unit_ms(cfg)
+    return f"{u * steps:.4g} ms ({steps} steps)" if u else f"{steps} steps (unit not measured)"
 
 
 def exposure_strategy(cfg: Dict[str, Any]) -> str:
@@ -399,7 +410,7 @@ def exposure_strategy(cfg: Dict[str, Any]) -> str:
 
 
 def _lock_v4l2(cam: Dict[str, Any], ctl: Dict[str, Any], strategy: str = "full_sequence",
-               unit_ms: float = UVC_UNIT_MS) -> set:
+               unit_ms: Optional[float] = None) -> set:
     dev = cam["device"]
     manual_exposure = ctl.get("auto_exposure") is False and ctl.get("exposure") is not None
     applied, failed, done = [], [], set()
@@ -422,7 +433,7 @@ def _lock_v4l2(cam: Dict[str, Any], ctl: Dict[str, Any], strategy: str = "full_s
         log.info("camera controls set: %s", ", ".join(applied))
     if failed:
         log.info("not available on this camera (nothing to pin): %s", ", ".join(failed))
-    if manual_exposure:
+    if manual_exposure and unit_ms:              # the check needs the real unit
         _verify_exposure(dev, ctl["exposure"], unit_ms)
     return set(ctl)        # v4l2-ctl is authoritative: no OpenCV retry, even for controls the camera lacks
 
@@ -486,7 +497,8 @@ def snapshot(cfg: Dict[str, Any], cap=None) -> Dict[str, Any]:
         if isinstance(ea.get("value"), int):
             summ["exposure_absolute"] = ea["value"]
             if summ["exposure_mode"] == "manual":
-                summ["exposure_ms"] = exposure_unit_ms(cfg) * ea["value"]
+                u = exposure_unit_ms(cfg)
+                summ["exposure_ms"] = u * ea["value"] if u else None
         if isinstance(ctr.get("gain", {}).get("value"), int):
             summ["gain"] = ctr["gain"]["value"]
     snap["summary"] = summ
@@ -506,8 +518,8 @@ def marker_fields(snap: Optional[dict], stab: Optional[dict], locked: bool) -> D
       exposure        = exposure_absolute, raw camera units; only in manual mode,
                         because in auto mode the stored value is stale ('inactive') and not the integration time used
       exposure_ms     = exposure x exposure_unit_ms: integration time [ms]
-      exposure_unit_ms = duration of one exposure unit [ms]: measured by scintcam diagnose (camera profile), else the
-                        UVC standard 0.1 ms, which many webcams do not follow
+      exposure_unit_ms = duration of one exposure unit [ms], measured by scintcam diagnose (camera profile); both keys
+                        are absent without a profile (the UVC standard 0.1 ms is not assumed)
       format          = "<pixel format> <width>x<height>" streamed by the driver
       camera_locked   = whether scintcam pinned the controls (camera.lock)
       stab_drift_pct, stab_rms_pct = last stability check, only when it could judge (lit scene)

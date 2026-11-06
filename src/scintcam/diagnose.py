@@ -602,7 +602,10 @@ def run(cfg: Dict[str, Any], out_path: str = "") -> int:
     if not C.have_v4l2ctl():
         print("scintcam diagnose needs Linux and v4l2-ctl (package v4l-utils)")
         return 2
-    out_path = out_path or cfg["camera"].get("profile") or "camera_profile.json"
+    if not out_path:          # default: camera.profile, next to the config file (where scintcam looks first)
+        out_path = cfg["camera"].get("profile") or "camera_profile.json"
+        if not os.path.isabs(out_path) and cfg.get("_path"):
+            out_path = os.path.join(os.path.dirname(cfg["_path"]), out_path)
     print("scintcam diagnose: about 3 minutes. Room lights ON, scene static (plate in view, nothing moving),\n"
           "scintcam and any other camera program closed. The camera settings are restored at the end.", flush=True)
     cap, _size, fps = C.open_camera(cfg["camera"])

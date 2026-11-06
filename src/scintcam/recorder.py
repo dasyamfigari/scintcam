@@ -178,8 +178,11 @@ class Recorder:
             }
             atomic_json(self._settings_path, self._settings)
             s = cam_start["summary"]
-            log.info("camera at start: exposure %s %s ms, gain %s, driver %s fps", s["exposure_mode"],
-                     s["exposure_ms"], s["gain"], s["driver_fps"])
+            exp = "" if s["exposure_absolute"] is None or s["exposure_mode"] != "manual" else (
+                f"{s['exposure_ms']:.4g} ms ({s['exposure_absolute']} steps)" if s["exposure_ms"] is not None
+                else f"{s['exposure_absolute']} steps (unit not measured)")
+            log.info("camera at start: exposure %s %s, gain %s, driver %s fps", s["exposure_mode"], exp,
+                     s["gain"], s["driver_fps"])
         self.header_fps, self.n, self._t_first, self.active = header_fps, 0, None, True
         self.t_start_mono = time.monotonic()
         log.info("recording %s (%s, header %.2f fps)", self.stem, src, header_fps)

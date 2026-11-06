@@ -71,7 +71,9 @@ scintcam -c my_setup.toml
 Webcams differ in how they take a setting, and reading a control back proves nothing (the driver caches what was
 written; the firmware may report a stored number while it uses another). `scintcam diagnose` therefore tests every
 control **by the image** with the stream running, and writes `camera_profile.json` (read by scintcam at start,
-`camera.profile`) plus a readable `camera_profile.txt`. Run it once per camera, with scintcam closed, the room lights
+`camera.profile`) plus a readable `camera_profile.txt`, next to the config file (scintcam looks there first,
+then in the folder it was started from; without a profile exposures are shown and logged in camera steps, not ms).
+Run it once per camera, with scintcam closed, the room lights
 on and a static, unsaturated scene; it takes about 3 minutes and restores the camera settings at the end.
 
 | Test | What is measured | Used by scintcam for |

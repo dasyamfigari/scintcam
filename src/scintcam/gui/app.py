@@ -371,8 +371,8 @@ class App:
             self.read_camera()
             s = self.cam_snap["summary"]
             log.info("camera now: exposure %s%s, gain %s, driver %s fps", s["exposure_mode"],
-                     "" if s["exposure_ms"] is None else f" {s['exposure_ms']:.4g} ms ({s['exposure_absolute']} steps)",
-                     s["gain"], s["driver_fps"])
+                     "" if s["exposure_mode"] != "manual" or s["exposure_absolute"] is None
+                     else " " + camera.exposure_text(self.cfg, s["exposure_absolute"]), s["gain"], s["driver_fps"])
         if self.engine is not None:
             try:
                 self._render()
@@ -589,10 +589,8 @@ class App:
         s = self.cam_snap["summary"]
         fmt = self.cam_snap.get("format") or {}
         size = f"{fmt.get('width', self.cam_size[0])}x{fmt.get('height', self.cam_size[1])} {fmt.get('pixel_format', '')}"
-        ems = s["exposure_ms"] if s["exposure_ms"] is not None else (
-            self._unit() * s["exposure_absolute"] if s["exposure_mode"] == "auto" and s["exposure_absolute"] is not None
-            else None)
-        exp = (f"{s['exposure_mode']}" + (f", {ems:.1f} ms" if ems is not None else "")
+        exp = (f"{s['exposure_mode']}" + (f", {self._fmt_exp(s['exposure_absolute'])}"
+                                          if s["exposure_mode"] == "manual" and s["exposure_absolute"] is not None else "")
                if s["exposure_mode"] else "n/a (no v4l2-ctl)")
         self._fill_camera_fields()
         self.lbl_cam.configure(text=f"device {self.cfg['camera']['device']}   {size}\n"
@@ -609,11 +607,14 @@ class App:
         self.lbl_ae.configure(text="ON: not for measurements" if auto else "")
         for key, (var, entry) in self.cam_entries.items():
             if key == "exposure_ms":
-                val = summ.get("exposure_ms")
+                lb, text = self.cam_labels[key]
+                lb.configure(text="exposure (ms)" if camera.exposure_unit_ms(self.cfg) else "exposure (steps)")
+                val = None if summ.get("exposure_absolute") is None or summ.get("exposure_mode") != "manual" \
+                    else self._unit() * summ["exposure_absolute"]
                 if auto:      # shown only once it differs from the stored manual value, i.e. it is really live
                     ea = summ.get("exposure_absolute")
                     val = self._unit() * ea if ea is not None and ea != self._ae_stale else None
-                var.set("" if val is None else f"{val:.4g}")
+                var.set("" if val is None else self._fieldtxt(val))
                 self._cam_shown[key] = var.get()
                 have = "exposure_absolute" in ctr or "exposure_time_absolute" in ctr
             else:
@@ -633,8 +634,15 @@ class App:
         return ((self.cfg.get("_profile") or {}).get("controls") or {}).get(name)
 
     def _unit(self):
-        """Exposure unit [ms per camera step]: measured (camera profile) or UVC standard 0.1 ms."""
-        return camera.exposure_unit_ms(self.cfg)
+        """Field unit per camera step: the measured ms per step (camera profile), else 1 (the field is in steps)."""
+        return camera.exposure_unit_ms(self.cfg) or 1.0
+
+    def _fieldtxt(self, val):
+        """Exposure field text: ms with 5 significant digits, or whole steps without a measured unit."""
+        return f"{val:.5g}" if camera.exposure_unit_ms(self.cfg) else str(int(round(val)))
+
+    def _fmt_exp(self, steps):
+        return camera.exposure_text(self.cfg, steps)
 
     def _profile_exp(self):
         return (self.cfg.get("_profile") or {}).get("exposure") or {}
@@ -665,7 +673,8 @@ class App:
             lo, hi = d.get("min"), d.get("max")
             if not unchanged and isinstance(lo, int) and isinstance(hi, int) and not lo <= val <= hi:
                 u = self._unit()
-                shown = (f"{lo * u:.4g}-{hi * u:.4g} ms" if key == "exposure_ms" else f"{lo}-{hi}")
+                shown = (f"{lo * u:.4g}-{hi * u:.4g} {'ms' if u != 1.0 else 'steps'}" if key == "exposure_ms"
+                         else f"{lo}-{hi}")
                 raise ValueError(f"{key}: {num:g} outside the camera's range {shown}; nothing applied")
             out[name] = val
         if "exposure" in out:
@@ -692,8 +701,8 @@ class App:
         log.info("applying camera settings: %s", ", ".join(f"{k}={v}" for k, v in vals.items()))
         ex = self._profile_exp()
         if "exposure" in vals and ex.get("full_rate_max") and vals["exposure"] > ex["full_rate_max"]:
-            log.warning("%.4g ms is above %.4g ms: on this camera the frame rate drops (camera profile)",
-                        self._unit() * vals["exposure"], self._unit() * ex["full_rate_max"])
+            log.warning("%s is above %s: on this camera the frame rate drops (camera profile)",
+                        self._fmt_exp(vals["exposure"]), self._fmt_exp(ex["full_rate_max"]))
         settle = float(ex.get("settle_s") or 0.5)
 
         def work():        # v4l2-ctl calls and the auto->manual pause take ~0.5 s: off the GUI thread
@@ -710,7 +719,7 @@ class App:
             ms, self._ae_read = self._ae_read, None
             if self.var_ae.get() and not self._cam_busy and self._ae_stale is not None \
                     and round(ms / self._unit()) != self._ae_stale:
-                txt = f"{ms:.4g}"
+                txt = self._fieldtxt(ms)
                 self.cam_entries["exposure_ms"][0].set(txt)
                 self._cam_shown["exposure_ms"] = txt
                 self.lbl_ae.configure(text="ON: not for measurements")
@@ -818,12 +827,12 @@ class App:
         if changed:
             cam["controls"]["exposure"] = e
         log.info("auto exposure OFF: manual %s, level %.1f (auto gave %.1f)",
-                 f"{self._unit() * e:.4g} ms" if isinstance(e, int) else "exposure", lv, target)
+                 self._fmt_exp(e) if isinstance(e, int) else "exposure", lv, target)
         if abs(lv - target) > tol:
             log.warning("could not match the auto brightness within 3 %%: set exposure (ms) by hand")
         if isinstance(e, int) and ex.get("full_rate_max") and e > ex["full_rate_max"]:
-            log.warning("%.4g ms is above %.4g ms: on this camera the frame rate drops",
-                        self._unit() * e, self._unit() * ex["full_rate_max"])
+            log.warning("%s is above %s: on this camera the frame rate drops",
+                        self._fmt_exp(e), self._fmt_exp(ex["full_rate_max"]))
 
     def save_camera(self):
         path = self.cfg.get("_path")
