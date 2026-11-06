@@ -38,6 +38,7 @@ DV20 = dict(unit_s=1.31e-6, k=0.00657, exp_range=(80, 100000))   # the TANDAR we
     ("latch_stored", "stale", False, {}, "store_then_cycle", "stale", "returns_to_stored"),
     ("keeps_auto", "live", True, {}, "direct", "live", "keeps_auto"),
     ("keeps_auto", "stale", True, DV20, "direct", "stale", "keeps_auto"),
+    ("keeps_auto", "stale", True, dict(DV20, ignore_same=True), "direct", "stale", "keeps_auto"),
 ])
 def test_diagnose_classifies_camera(fakecam, tmp_path, behaviour, readback, clamp, extra, apply, auto_rb, after):
     fakeuvc.make_state(str(fakecam), behaviour, readback, clamp, **extra)
@@ -47,6 +48,8 @@ def test_diagnose_classifies_camera(fakecam, tmp_path, behaviour, readback, clam
     ex = p["exposure"]
     assert ex["apply"] == apply and ex["auto_readback"] == auto_rb and ex["manual_after_auto"] == after
     assert ex["out_of_range"] == ("clamped" if clamp else "accepted")
+    assert ex["lock_from_auto"] == "ok"                     # start-up lock from auto, target already stored
+    assert ex["response"]["points"] >= 3 and ex["response"]["ms_min"] < ex["response"]["ms_max"]
     unit_true = 1e3 * extra.get("unit_s", 1e-4)              # exposure unit measured from the frame rate
     assert abs(ex["unit_ms_measured"] / unit_true - 1) < 0.1
     assert 28.0 <= ex["full_rate_max_ms"] <= 40.0          # sensor slows down above 1/30 s (sim timing jitter)
@@ -73,3 +76,21 @@ def test_profile_sets_exposure_strategy(fakecam, tmp_path):
     assert json.loads(fakecam.read_text())["active"] == 420  # in effect on the first application
     (tmp_path / "p.json").write_text(json.dumps({"device": {"card": "Another camera"}, "exposure": {"apply": "direct"}}))
     assert C.load_profile(cfg) is None and C.exposure_strategy(cfg) == "full_sequence"
+
+
+def test_lock_from_auto_with_target_already_stored(fakecam, tmp_path):
+    """DV20-like camera: auto -> manual keeps the auto exposure without updating the stored number, and a write equal
+    to the stored number is skipped. The lock must still put the target into effect (neighbour write first)."""
+    fakeuvc.make_state(str(fakecam), "keeps_auto", "stale", True, ignore_same=True, **DV20)
+    st = json.loads(fakecam.read_text())
+    st["controls"]["exposure_absolute"]["value"] = 30000     # target already stored, camera in auto
+    fakecam.write_text(json.dumps(st))
+    cfg = load_config(None)
+    cfg["camera"]["profile"] = str(tmp_path / "p.json")
+    (tmp_path / "p.json").write_text(json.dumps({"device": {"card": "Fake UVC Camera: Fake"},
+                                                 "exposure": {"apply": "direct"}}))
+    C.load_profile(cfg)
+    cfg["camera"]["controls"].update(auto_exposure=False, exposure=30000)
+    C.lock_camera(None, cfg)
+    st = json.loads(fakecam.read_text())
+    assert st["controls"]["exposure_auto"]["value"] == 1 and st["active"] == 30000

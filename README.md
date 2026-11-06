@@ -81,13 +81,17 @@ on and a static, unsaturated scene; it takes about 3 minutes and restores the ca
 | exposure method | level after writing a new exposure in manual (*direct*), after a short auto → manual switch (*store_then_cycle*), after writing it in auto (*write_in_auto*) | applying an exposure on the first try |
 | latency | time from the command to the new level in the image | waiting before reading back |
 | auto exposure | level and read-back in auto; level after auto → manual | whether to show the auto value; matching on switch-off |
-| exposure scan | level, saturated fraction and delivered frame rate for 10+ exposures; frame-rate limit by bisection; fit level = a + b·exposure | warning when an exposure slows the camera; linearity (R², power) |
+| lock from auto | camera in auto with the target already stored, then the exposure method: is the level back at the target's? (*ok* / *fails* / *unknown*) | checking the start-up lock as it really happens |
+| exposure scan | level, saturated fraction and delivered frame rate for 10+ exposures; frame-rate limit by bisection; fit level = a + b·t (a offset [counts], b slope [counts/ms], t exposure time [ms]) on the points with ≤ 0.5 % of the scene saturated and level 5–240 (number of points and ms range in the profile) | warning when an exposure slows the camera; linearity (R², power) |
 | exposure unit | beyond the limit the frame period follows the exposure: 1/fps = u·E + d (u duration of one step, E exposure in camera steps, d readout time); u is the fitted slope | converting camera steps to ms everywhere (fields, log, `.done` marker) |
-| other controls | each integer control moved by ¼ of its range: change of level and colour, read-back, out-of-range write (clamped / error / accepted), reversibility | marking controls without effect |
+| other controls | each integer control moved by ¼ of its range (rounded to the control's step): change of level and colour, read-back, out-of-range write (clamped / error / accepted), reversibility | marking controls without effect |
 | reopen | level and mode after closing and reopening the stream | knowing whether settings survive a restart |
 
 Without a profile scintcam uses the method that works on all three kinds of camera (`full_sequence`: auto, manual,
-write, short auto → manual, write again). A profile made for another camera (different card name) is ignored.
+write, short auto → manual, write again). Every exposure write is preceded by a write of the neighbouring value
+(target − 1), so that the final write is a real change even when the camera already stores the target number (after
+auto → manual, some cameras keep the auto exposure but still store the old number, and a write of the same number is
+not guaranteed to reach the sensor). A profile made for another camera (different card name) is ignored.
 
 ![Corner picker after auto-detection, with the loupe](docs/picker.png)
 
@@ -116,7 +120,7 @@ In `recording.dir`, with `stem` = start time `YYYY-MM-DD-HHMMSS`:
 | `<stem>.mkv`, `<stem>_rect.mkv` | raw and rectified video (`recording.source`), FFV1 lossless |
 | `<stem>_frames.csv` | `frame, t_s, t_driver_ms`: host time of every frame and the driver timestamp |
 | `<stem>_settings.json` | written at start, completed at stop: camera controls read back from the driver at start and stop (exposure in ms, gain, every control, changes during the clip), last stability check, the full rectification (corners, homography, distortion, mm/px, channel) |
-| `<stem>.done` | written **last**, after every other file is closed: the clip is complete. Watchers on other machines can wait for it. `"files"` lists the videos only. It also carries the camera state at the start in flat keys: every V4L2 control by its driver name, `exposure` (100 µs units, manual mode only), `format`, `camera_locked`, `stab_drift_pct`, `stab_rms_pct` |
+| `<stem>.done` | written **last**, after every other file is closed: the clip is complete. Watchers on other machines can wait for it. `"files"` lists the videos only. It also carries the camera state at the start in flat keys: every V4L2 control by its driver name, `exposure` (camera steps, manual mode only; `exposure_ms` and `exposure_unit_ms` when the profile has the measured unit), `format`, `camera_locked`, `stab_drift_pct`, `stab_rms_pct` |
 | `rectify_points.json` | geometry of each raw clip under its file name, schema of `beamview.write_rectification` (offline tools need no re-picking) |
 
 A crash writes no `.done`, so an incomplete clip is never picked up automatically.

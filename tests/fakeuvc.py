@@ -9,6 +9,7 @@ ways real cameras differ:
   clamp     = True | False      out-of-range writes clamped (uvcvideo) or accepted as is
   unit_s    = duration of one exposure step [s] (UVC standard 1e-4; the TANDAR DV20 webcam about 1.3e-6)
   k         = level per exposure step [counts]
+  ignore_same = True: a write equal to the STORED exposure does not reach the sensor (firmware that skips "no change")
 A camera with stale read-back that keeps the auto exposure does not update the stored register either (DV20).
 """
 import json
@@ -34,12 +35,13 @@ CONTROLS = {
 }
 
 
-def make_state(path, behaviour="direct", readback="live", clamp=True, unit_s=1e-4, k=0.4, exp_range=None):
+def make_state(path, behaviour="direct", readback="live", clamp=True, unit_s=1e-4, k=0.4, exp_range=None,
+               ignore_same=False):
     ctl = json.loads(json.dumps(CONTROLS))
     if exp_range:
         ctl["exposure_absolute"].update(min=exp_range[0], max=exp_range[1])
     st = {"controls": ctl, "behaviour": behaviour, "readback": readback, "clamp": clamp, "unit_s": unit_s, "k": k,
-          "active": ctl["exposure_absolute"]["value"]}
+          "ignore_same": ignore_same, "active": ctl["exposure_absolute"]["value"]}
     with open(path, "w") as f:
         json.dump(st, f)
     return path
@@ -130,8 +132,9 @@ def ctl_main(argv):
                 else:
                     st["active"] = c["exposure_absolute"]["value"]
         elif k == "exposure_absolute":
+            same = v == d["value"]
             d["value"] = v
-            if _v(st, "exposure_auto") == 1 and beh in ("direct", "keeps_auto"):
+            if _v(st, "exposure_auto") == 1 and beh in ("direct", "keeps_auto") and not (same and st.get("ignore_same")):
                 st["active"] = v
         else:
             d["value"] = v

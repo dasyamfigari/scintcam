@@ -294,6 +294,30 @@ class Diagnosis:
                 self.note(f"auto exposure also changes the gain ({g_manual} -> {g_auto})")
         return r
 
+    def lock_from_auto(self, e: int, method: str, wait_s: float) -> str:
+        """The start-up lock: camera in auto, the target exposure already STORED (it is usually the last value used).
+        Does `method` put the target into effect? Judged by the level, against the level the target gives in manual.
+
+            ok       level back at the target's level (within max(threshold, 10 % of the auto - target difference))
+            fails    level stays elsewhere (typically at the auto level): the lock would record a wrong exposure
+            unknown  auto chose about the target's level, so the test cannot tell
+        """
+        self.robust(e)
+        le = self.look()["level"]
+        self.mode(3)
+        la = self.look(max(self.settle, wait_s))["level"]
+        C.apply_exposure(self.dev, e, method, self.cam["exposure_cycle_delay_s"] * SCALE)
+        lb = self.look()["level"]
+        if not self.effect(la, le):
+            res = "unknown"
+        else:
+            res = "ok" if abs(lb - le) <= max(self.thr, 0.1 * abs(la - le)) else "fails"
+        self.say(f"lock from auto: target {e} gives level {le:.1f}; auto {la:.1f}; after '{method}' {lb:.1f} -> {res}")
+        if res == "fails":
+            self.note(f"locking from auto mode with '{method}' does NOT put the stored exposure into effect "
+                      f"(level {lb:.1f} instead of {le:.1f}): report this camera, the lock is not reliable")
+        return res
+
     def _point(self, e: int, method: str) -> Dict[str, Any]:
         C.apply_exposure(self.dev, e, method, self.cam["exposure_cycle_delay_s"] * SCALE)
         st = self.look(self.settle, 0.8)
@@ -404,12 +428,19 @@ class Diagnosis:
             lv = np.array([x["level"] for x in good])
             b, a = np.polyfit(e, lv, 1)
             r2 = 1 - ((lv - (a + b * e)) ** 2).sum() / max(((lv - lv.mean()) ** 2).sum(), 1e-9)
-            r["response"] = {"offset": round(float(a), 3), "slope_per_ms": round(float(b), 4), "r2": round(float(r2), 4)}
+            r["response"] = {"offset": round(float(a), 3), "slope_per_ms": round(float(b), 4), "r2": round(float(r2), 4),
+                             "points": int(len(good)), "ms_min": round(float(e.min()), 3),
+                             "ms_max": round(float(e.max()), 3)}
             pos = lv - a > 1
             if pos.sum() >= 3:
                 r["response"]["power"] = round(float(np.polyfit(np.log(e[pos]), np.log(lv[pos] - a), 1)[0]), 3)
             self.say(f"level = {a:.2f} + {b:.4f} x exposure[ms]  (R2 {r2:.4f}, "
-                     f"power {r['response'].get('power', float('nan')):.2f})")
+                     f"power {r['response'].get('power', float('nan')):.2f}; {len(good)} points, "
+                     f"{e.min():.2f}-{e.max():.2f} ms)")
+            if len(good) < 5:
+                self.note(f"linearity fitted on {len(good)} scan points only ({e.min():.1f}-{e.max():.1f} ms): the "
+                          f"other points have > 0.5 % of the scene saturated or a level outside 5-240; "
+                          f"dim the scene to widen the range")
             if r2 < 0.98:
                 self.note("level is not proportional to exposure (gamma or another curve is on): "
                           "intensities are not linear in light")
@@ -450,7 +481,9 @@ class Diagnosis:
                 out[name] = entry
                 continue
             v0, span = d["value"], d["max"] - d["min"]
-            v1 = v0 + span // 4 if v0 + span // 4 <= d["max"] else v0 - span // 4
+            stp = int(d.get("step") or 1)
+            dv = max(stp, int(round(span / 4 / stp)) * stp)     # 1/4 of the range, on the control's step grid
+            v1 = v0 + dv if v0 + dv <= d["max"] else v0 - dv
             ok, msg = self.set(name, v1)
             st = self.look()
             rb = self.get(name)
@@ -546,6 +579,12 @@ class Diagnosis:
                 self.settle = ex["settle_s"]
                 print("\n[5/7] auto exposure", flush=True)
                 ex.update(self.auto_behaviour(ea))
+                stc = (ex["tests"].get("store_then_cycle") or {}).get("fraction")
+                if ex.get("manual_after_auto") == "keeps_auto" and stc is not None and stc < 0.5:
+                    self.note(f"an auto -> manual switch does not latch the stored exposure, it keeps the one auto "
+                              f"chose (store_then_cycle reached {100 * stc:.0f} % of the change): never set the "
+                              f"exposure by cycling the mode on this camera")
+                ex["lock_from_auto"] = self.lock_from_auto(ex.get("stored", ea), use, ex.get("auto_settle_s", 1.0))
                 print("\n[6/7] exposure scan", flush=True)
                 ex.update(self.scan(use, ea))
                 ex["out_of_range"] = self.out_of_range(self.exp)
@@ -576,7 +615,7 @@ def report_text(p: Dict[str, Any]) -> str:
     L.append(f"scene   level {sc.get('level')}  noise {sc.get('noise')}  effect threshold {sc.get('effect_threshold')} counts")
     L += ["", "FINDINGS"] + [f"  - {f}" for f in p.get("findings", [])] + ["", "EXPOSURE"]
     for k in ("control", "auto_control", "unit_ms", "unit_source", "unit_fit", "declared_min", "declared_max",
-              "apply", "settle_s", "auto_readback", "manual_after_auto", "auto_settle_s", "fps_full", "full_rate_max",
+              "apply", "settle_s", "auto_readback", "manual_after_auto", "lock_from_auto", "auto_settle_s", "fps_full", "full_rate_max",
               "full_rate_max_ms", "rate_drops_from", "saturates_from", "out_of_range", "response"):
         if k in ex:
             L.append(f"  {k:<20} {ex[k]}")

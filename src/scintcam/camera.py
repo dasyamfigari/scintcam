@@ -346,7 +346,8 @@ EXPOSURE_STRATEGIES = ("direct", "store_then_cycle", "write_in_auto", "full_sequ
 
 
 def apply_exposure(dev, value: int, strategy: str = "full_sequence", delay_s: float = 0.35) -> None:
-    """Put a manual exposure into effect (value in UVC units of 100 us), by the method the camera needs.
+    """Put a manual exposure into effect (value in camera steps; duration of one step from the profile, see
+    exposure_unit_ms), by the method the camera needs.
 
     direct            write the value in manual mode (cameras that apply manual writes at once)
     store_then_cycle  write it (stored, not used), then a short auto -> manual transition, which latches the STORED
@@ -355,9 +356,20 @@ def apply_exposure(dev, value: int, strategy: str = "full_sequence", delay_s: fl
     full_sequence     auto, wait, manual, write, short auto -> manual, write again: works on all three kinds above,
                       used when no camera profile says which kind this camera is
     `scintcam diagnose` finds the method by watching the image; reading the value back proves nothing.
+
+    Every write is preceded by a write of a neighbouring value (value - 1, or value + 1 at 1): a camera that switched
+    auto -> manual keeping the auto exposure may still hold the target as its STORED number, and a write equal to
+    the stored number is not guaranteed to reach the sensor. Changing the number first makes the final write a real
+    change. (At the declared minimum the driver clamps value - 1 back to the same number.)
     """
+    nudge = int(value) - 1 if int(value) > 1 else int(value) + 1
     auto = lambda v: any(v4l2_set(dev, n, v) for n in CONTROL_MAP["auto_exposure"][0])
-    expo = lambda: any(v4l2_set(dev, n, int(value)) for n in CONTROL_MAP["exposure"][0])
+
+    def expo() -> bool:
+        for n in CONTROL_MAP["exposure"][0]:
+            if v4l2_set(dev, n, nudge):
+                return v4l2_set(dev, n, int(value))
+        return False
     if strategy == "direct":
         auto(1)
         expo()
@@ -473,9 +485,9 @@ _SNAP_PROPS = ("exposure", "auto_exposure", "gain", "brightness", "contrast", "s
 def snapshot(cfg: Dict[str, Any], cap=None) -> Dict[str, Any]:
     """State the camera is ACTUALLY in, read back from the driver (not what the configuration asked for).
 
-    exposure_ms = u * exposure_absolute, u = exposure unit [ms] (measured in the camera profile, else the UVC standard
-    0.1 ms); filled only in manual mode
-    (exposure_auto = 1), because in auto mode the driver keeps a stale value flagged 'inactive'.
+    exposure_ms = u * exposure_absolute, u = exposure unit [ms] measured in the camera profile; empty without a measured
+    unit (the UVC standard 0.1 ms is not assumed), and filled only in manual mode (exposure_auto = 1), because in auto
+    mode the driver keeps a stale value flagged 'inactive'.
     """
     dev = cfg["camera"]["device"]
     snap: Dict[str, Any] = {"time": datetime.datetime.now().isoformat(timespec="milliseconds"),
