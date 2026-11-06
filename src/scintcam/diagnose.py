@@ -32,7 +32,7 @@ log = logging.getLogger("scintcam")
 
 SCALE = 1.0               # multiplies every wait (tests run a fast simulated camera with SCALE < 1)
 PROFILE_VERSION = 1
-UNIT_MS = 0.1             # UVC exposure_absolute unit: 100 us
+UNIT_MS = 0.1             # UVC standard unit of exposure_absolute (100 us); many cameras differ: measured below
 RATE_DROP = 0.95          # delivered rate below 95 % of the short-exposure rate counts as slowed down
 
 
@@ -68,9 +68,9 @@ class Meter:
                 break
         return out
 
-    def drain(self, seconds: float) -> None:
-        """Keep reading (and discard) so that frames queued before a change are gone."""
-        self._frames(seconds, 1)
+    def drain(self, seconds: float, n_min: int = 3) -> None:
+        """Keep reading (and discard) so that frames queued before a change are gone (>= n_min frames)."""
+        self._frames(seconds, n_min)
 
     def measure(self, seconds: float = 0.6, n_min: int = 6) -> Dict[str, Any]:
         """level/colour/saturation means over the frames; fps = 1 / median frame interval (robust to read jitter)."""
@@ -168,12 +168,12 @@ class Diagnosis:
         """Manual exposure giving a mid level (40-150 counts), so that halving or doubling it stays measurable."""
         d = self.ctr.get(self.exp, {})
         e = d.get("value") if isinstance(d.get("value"), int) else d.get("default", 100)
-        e = self.clampe(min(e, 0.5 / self.fps / 1e-4))
+        e = self.clampe(e)                 # start from the camera's current value
         st = None
-        for _ in range(8):
+        for _ in range(10):
             self.robust(e)
-            st = self.look(max(self.settle, 6 * e * 1e-4))
-            self.say(f"exposure {e * UNIT_MS:8.1f} ms -> level {st['level']:6.1f}")
+            st = self.look()
+            self.say(f"exposure {e:>7} -> level {st['level']:6.1f}")
             if st["level"] > 150 and e > d.get("min", 1):
                 e = self.clampe(e / 3)
             elif st["level"] < 40 and e < d.get("max", 10000):
@@ -200,7 +200,7 @@ class Diagnosis:
         self.robust(eb)
         lb = self.look()["level"]
         r["full_sequence"] = {"level_a": round(la, 2), "level_b": round(lb, 2)}
-        self.say(f"full sequence: {ea * UNIT_MS:.1f} ms -> {la:.1f}, {eb * UNIT_MS:.1f} ms -> {lb:.1f}")
+        self.say(f"full sequence: exposure {ea} -> level {la:.1f}, {eb} -> {lb:.1f}")
         if not self.effect(la, lb):
             r["apply"] = "none"
             self.note("the exposure control has NO visible effect, even with the full auto/manual sequence")
@@ -277,7 +277,7 @@ class Diagnosis:
         else:
             keeps = abs(lm - r["level_auto"]) < abs(lm - r["level_stored"])
             r["manual_after_auto"] = "keeps_auto" if keeps else "returns_to_stored"
-        self.say(f"auto: level {r['level_stored']:.1f} (stored {r['stored'] * UNIT_MS:.1f} ms) -> {r['level_auto']:.1f}"
+        self.say(f"auto: level {r['level_stored']:.1f} (stored exposure {r['stored']}) -> {r['level_auto']:.1f}"
                  f" in auto, reads {reads}; back in manual: level {lm:.1f}, reads {r['readback_manual_after']}")
         if r["auto_readback"] == "stale":
             self.note("in auto mode the camera reports the STORED manual exposure, not the one it uses: "
@@ -294,47 +294,85 @@ class Diagnosis:
                 self.note(f"auto exposure also changes the gain ({g_manual} -> {g_auto})")
         return r
 
+    def _point(self, e: int, method: str) -> Dict[str, Any]:
+        C.apply_exposure(self.dev, e, method, self.cam["exposure_cycle_delay_s"] * SCALE)
+        st = self.look(self.settle, 0.8)
+        self.say(f"exposure {e:>7}  level {st['level']:6.1f}  saturated {100 * st['sat']:5.1f} %  {st['fps']:5.1f} fps")
+        return {"exposure": int(e), "level": round(st["level"], 2), "sat": round(st["sat"], 4),
+                "fps": round(st["fps"], 3)}
+
     def scan(self, method: str, ea: int) -> Dict[str, Any]:
-        """Level, saturation and delivered rate against exposure."""
+        """Level, saturation and delivered rate against exposure; exposure unit from the frame rate.
+
+        Once the exposure is longer than the frame period the sensor must slow down, and then
+            T_frame = 1 / fps = u E + d
+        T_frame frame period [s], E exposure in camera units, u duration of one unit [s] (UVC standard: 100 us),
+        d fixed readout/blanking time [s]. The slope u is the real exposure unit."""
         d = self.ctr.get(self.exp, {})
-        period = 1.0 / self.fps / 1e-4                       # frame period in exposure units
+        top = d.get("max", 10000)
         lo = self.clampe(max(d.get("min", 1), ea / 16))
-        hi = self.clampe(min(d.get("max", 10000), max(ea * 8, 4 * period)))
+        hi = self.clampe(min(top, ea * 8))
         vals = sorted(set(self.clampe(v) for v in np.geomspace(max(lo, 1), max(hi, lo + 1), 10)))
-        rows = []
-        for e in vals:
-            C.apply_exposure(self.dev, e, method, self.cam["exposure_cycle_delay_s"] * SCALE)
-            st = self.look(max(self.settle, 4 * e * 1e-4), max(0.8, 6 * e * 1e-4))
-            rows.append({"exposure": e, "ms": round(e * UNIT_MS, 2), "level": round(st["level"], 2),
-                         "sat": round(st["sat"], 4), "fps": round(st["fps"], 2)})
-            self.say(f"{e * UNIT_MS:8.1f} ms  level {st['level']:6.1f}  saturated {100 * st['sat']:5.1f} %  "
-                     f"{st['fps']:5.1f} fps")
-        r: Dict[str, Any] = {"scan": rows}
-        f0 = np.median([x["fps"] for x in rows[:3]])
+        rows = [self._point(e, method) for e in vals]
+        f0 = float(np.median([x["fps"] for x in rows[:3]]))
+        for _ in range(6):           # extend until the rate drops (needed for the unit), frames shorter than ~0.5 s
+            last = rows[-1]
+            if last["fps"] < RATE_DROP * f0 or last["exposure"] >= top or last["fps"] < 2:
+                break
+            rows.append(self._point(self.clampe(last["exposure"] * 2), method))
+        r: Dict[str, Any] = {"scan": rows, "fps_full": round(f0, 3)}
         k = len(rows)                 # slow region = the longest exposures, all below RATE_DROP * f0
         while k > 0 and rows[k - 1]["fps"] < RATE_DROP * f0:
             k -= 1
         fast, slow = rows[:k], rows[k:]
-        r["full_rate_max_ms"] = max(x["ms"] for x in fast) if fast else None
-        first_slow = dict(slow[0]) if slow else None
-        if slow and fast:          # bisect between the last full-rate and the first slow exposure
-            a_, b_ = max(x["exposure"] for x in fast), slow[0]["exposure"]
+        a_ = max(x["exposure"] for x in fast) if fast else None
+        b_ = slow[0]["exposure"] if slow else None
+        if slow and fast:            # bisect between the last full-rate and the first slow exposure
             for _ in range(4):
                 if b_ - a_ <= 1:
                     break
                 mid = (a_ + b_) // 2
                 C.apply_exposure(self.dev, mid, method, self.cam["exposure_cycle_delay_s"] * SCALE)
-                f = self.look(max(self.settle, 4 * mid * 1e-4), max(0.8, 6 * mid * 1e-4))["fps"]
+                f = self.look(self.settle, 0.8)["fps"]
                 a_, b_ = (mid, b_) if f >= RATE_DROP * f0 else (a_, mid)
-            r["full_rate_max_ms"] = round(a_ * UNIT_MS, 2)
-            r["rate_drops_from_ms"] = round(b_ * UNIT_MS, 2)
-            self.say(f"full frame rate up to {a_ * UNIT_MS:.1f} ms, slower from {b_ * UNIT_MS:.1f} ms")
+        pts = [(x["exposure"], 1.0 / x["fps"]) for x in slow if x["fps"] > 0]
+        if b_:
+            for fac in (1.3, 1.7):   # two more points beyond the limit for the slope
+                e = self.clampe(b_ * fac)
+                if e not in [p[0] for p in pts] and e > b_:
+                    st = self._point(e, method)
+                    if st["fps"] > 0 and st["fps"] < RATE_DROP * f0:
+                        pts.append((e, 1.0 / st["fps"]))
+        unit, src = UNIT_MS, "UVC standard (not measured: the frame rate never dropped)"
+        if len(pts) >= 2 and max(p[0] for p in pts) > 1.15 * min(p[0] for p in pts):
+            x = np.array([p[0] for p in pts], float)
+            y = np.array([p[1] for p in pts]) / SCALE
+            u, dd = np.polyfit(x, y, 1)
+            r2 = 1 - ((y - (u * x + dd)) ** 2).sum() / max(((y - y.mean()) ** 2).sum(), 1e-18)
+            r["unit_fit"] = {"points": len(pts), "unit_us": round(u * 1e6, 4), "readout_ms": round(dd * 1e3, 3),
+                             "r2": round(float(r2), 5)}
+            self.say(f"frame period = {u * 1e6:.4f} us x exposure + {dd * 1e3:.2f} ms   (R2 {r2:.4f}, {len(pts)} points)")
+            if u > 0 and r2 > 0.98:
+                unit, src = u * 1e3, "measured from the frame rate"
+                r["unit_ms_measured"] = round(unit, 7)
+        r["unit_ms"], r["unit_source"] = round(unit, 7), src
+        for x in rows:
+            x["ms"] = round(x["exposure"] * unit, 3)
+        if "unit_ms_measured" in r:
+            msg = f"1 exposure unit = {unit * 1e3:.3f} us (measured from the frame rate; UVC standard: 100 us)"
+            if abs(unit / UNIT_MS - 1) > 0.1:
+                msg += f": this camera does NOT use 100 us; 'exposure / 10 ms' is wrong by x{UNIT_MS / unit:.1f}"
+            self.note(msg)
+        else:
+            self.note("exposure unit not measured (the frame rate never dropped): ms values assume 100 us units")
         if slow:
-            r.setdefault("rate_drops_from_ms", first_slow["ms"])
-            self.note(f"exposures longer than {r['full_rate_max_ms']} ms lower the frame rate "
-                      f"({f0:.1f} fps -> {first_slow['fps']:.1f} fps at {first_slow['ms']:.1f} ms)")
+            r["full_rate_max"], r["rate_drops_from"] = a_, b_
+            r["full_rate_max_ms"] = round(a_ * unit, 3) if a_ else None
+            self.note(f"exposure above {a_} ({a_ * unit:.1f} ms) lowers the frame rate "
+                      f"({f0:.1f} fps -> {slow[-1]['fps']:.1f} fps at {slow[-1]['exposure']})" if a_ else
+                      "the frame rate drops at every exposure tested")
         sat = [x for x in rows if x["sat"] > 0.01 or x["level"] > 245]
-        r["saturates_from_ms"] = sat[0]["ms"] if sat else None
+        r["saturates_from"] = sat[0]["exposure"] if sat else None
         good = [x for x in rows if x["sat"] <= 0.005 and 5 < x["level"] < 240]
         if len(good) >= 3:
             e = np.array([x["ms"] for x in good])
@@ -345,12 +383,12 @@ class Diagnosis:
             pos = lv - a > 1
             if pos.sum() >= 3:
                 r["response"]["power"] = round(float(np.polyfit(np.log(e[pos]), np.log(lv[pos] - a), 1)[0]), 3)
-            self.say(f"level = {a:.1f} + {b:.3f} x exposure[ms]  (R2 {r2:.4f}, "
+            self.say(f"level = {a:.2f} + {b:.4f} x exposure[ms]  (R2 {r2:.4f}, "
                      f"power {r['response'].get('power', float('nan')):.2f})")
             if r2 < 0.98:
                 self.note("level is not proportional to exposure (gamma or another curve is on): "
                           "intensities are not linear in light")
-        if len(vals) >= 2 and len(set(x["level"] for x in rows)) == 1:
+        if len(set(x["level"] for x in rows)) == 1:
             self.note("the scan shows no change at all")
         return r
 
@@ -459,6 +497,7 @@ class Diagnosis:
             self.note("this camera has no V4L2 exposure / auto-exposure controls: only the other controls are tested")
         self.pin_automatics()
         ex: Dict[str, Any] = {"control": self.exp, "auto_control": self.ae, "unit_ms": UNIT_MS,
+                              "unit_source": "UVC standard (not measured)",
                               "declared_min": self.ctr.get(self.exp, {}).get("min"),
                               "declared_max": self.ctr.get(self.exp, {}).get("max")}
         self.p["exposure"] = ex
@@ -510,14 +549,15 @@ def report_text(p: Dict[str, Any]) -> str:
     sc = p.get("scene") or {}
     L.append(f"scene   level {sc.get('level')}  noise {sc.get('noise')}  effect threshold {sc.get('effect_threshold')} counts")
     L += ["", "FINDINGS"] + [f"  - {f}" for f in p.get("findings", [])] + ["", "EXPOSURE"]
-    for k in ("control", "auto_control", "declared_min", "declared_max", "apply", "settle_s", "auto_readback",
-              "manual_after_auto", "auto_settle_s", "full_rate_max_ms", "rate_drops_from_ms", "saturates_from_ms",
-              "out_of_range", "response"):
+    for k in ("control", "auto_control", "unit_ms", "unit_source", "unit_fit", "declared_min", "declared_max",
+              "apply", "settle_s", "auto_readback", "manual_after_auto", "auto_settle_s", "fps_full", "full_rate_max",
+              "full_rate_max_ms", "rate_drops_from", "saturates_from", "out_of_range", "response"):
         if k in ex:
             L.append(f"  {k:<20} {ex[k]}")
     if ex.get("scan"):
-        L.append("  scan:   ms      level   sat %    fps")
-        L += [f"        {r['ms']:8.1f} {r['level']:8.1f} {100 * r['sat']:7.2f} {r['fps']:6.1f}" for r in ex["scan"]]
+        L.append("  scan: exposure        ms    level   sat %    fps")
+        L += [f"        {r['exposure']:>8} {r['ms']:9.3f} {r['level']:8.1f} {100 * r['sat']:7.2f} {r['fps']:6.2f}"
+              for r in ex["scan"]]
     L += ["", "OTHER CONTROLS  (change by 1/4 of the range; effect on this scene)",
           f"  {'control':<28} {'min':>6} {'max':>6} {'value':>6}  {'effect':<14} readback  out-of-range"]
     for n, e in (p.get("controls") or {}).items():

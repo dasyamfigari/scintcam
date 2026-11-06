@@ -332,7 +332,7 @@ def lock_camera(cap, cfg: Dict[str, Any]) -> None:
     use_v4l2 = have_v4l2ctl() if cam["use_v4l2ctl"] == "auto" else bool(cam["use_v4l2ctl"])
     done = set()
     if use_v4l2:
-        done = _lock_v4l2(cam, ctl, exposure_strategy(cfg))
+        done = _lock_v4l2(cam, ctl, exposure_strategy(cfg), exposure_unit_ms(cfg))
     elif IS_LINUX:
         log.warning("v4l2-ctl not found (install v4l-utils): controls set through OpenCV only, less reliable")
     _lock_opencv(cap, ctl, skip=done)
@@ -379,6 +379,16 @@ def apply_exposure(dev, value: int, strategy: str = "full_sequence", delay_s: fl
         expo()
 
 
+UVC_UNIT_MS = 0.1        # UVC standard exposure_absolute unit (100 us); not all cameras follow it
+
+
+def exposure_unit_ms(cfg: Dict[str, Any]) -> float:
+    """Duration of one exposure_absolute step [ms]: measured by `scintcam diagnose` (from the frame rate) when the
+    profile has it, otherwise the UVC standard 0.1 ms."""
+    u = ((cfg.get("_profile") or {}).get("exposure") or {}).get("unit_ms_measured")
+    return float(u) if isinstance(u, (int, float)) and u > 0 else UVC_UNIT_MS
+
+
 def exposure_strategy(cfg: Dict[str, Any]) -> str:
     """From the camera profile when there is one, otherwise the safe full sequence (or direct if cycling is off)."""
     prof = cfg.get("_profile") or {}
@@ -388,7 +398,8 @@ def exposure_strategy(cfg: Dict[str, Any]) -> str:
     return "full_sequence" if cfg["camera"]["exposure_cycle"] else "direct"
 
 
-def _lock_v4l2(cam: Dict[str, Any], ctl: Dict[str, Any], strategy: str = "full_sequence") -> set:
+def _lock_v4l2(cam: Dict[str, Any], ctl: Dict[str, Any], strategy: str = "full_sequence",
+               unit_ms: float = UVC_UNIT_MS) -> set:
     dev = cam["device"]
     manual_exposure = ctl.get("auto_exposure") is False and ctl.get("exposure") is not None
     applied, failed, done = [], [], set()
@@ -412,15 +423,15 @@ def _lock_v4l2(cam: Dict[str, Any], ctl: Dict[str, Any], strategy: str = "full_s
     if failed:
         log.info("not available on this camera (nothing to pin): %s", ", ".join(failed))
     if manual_exposure:
-        _verify_exposure(dev, ctl["exposure"])
+        _verify_exposure(dev, ctl["exposure"], unit_ms)
     return set(ctl)        # v4l2-ctl is authoritative: no OpenCV retry, even for controls the camera lacks
 
 
-def _verify_exposure(dev, exposure) -> None:
+def _verify_exposure(dev, exposure, unit_ms: float = UVC_UNIT_MS) -> None:
     """A long exposure forces the sensor to slow down; if it does not fit in the frame period and the driver rate did
     not drop, the camera is ignoring the value (reading it back would not tell)."""
     fps = v4l2_driver_fps(dev)
-    exp_ms = 0.1 * float(exposure)      # UVC exposure unit = 100 us
+    exp_ms = unit_ms * float(exposure)
     if fps:
         log.info("exposure %s (%.1f ms); driver reports %.1f fps", exposure, exp_ms, fps)
         if exp_ms > 1150.0 / fps:
@@ -451,7 +462,8 @@ _SNAP_PROPS = ("exposure", "auto_exposure", "gain", "brightness", "contrast", "s
 def snapshot(cfg: Dict[str, Any], cap=None) -> Dict[str, Any]:
     """State the camera is ACTUALLY in, read back from the driver (not what the configuration asked for).
 
-    exposure_ms = 0.1 * exposure_absolute, with exposure_absolute in UVC units of 100 us; filled only in manual mode
+    exposure_ms = u * exposure_absolute, u = exposure unit [ms] (measured in the camera profile, else the UVC standard
+    0.1 ms); filled only in manual mode
     (exposure_auto = 1), because in auto mode the driver keeps a stale value flagged 'inactive'.
     """
     dev = cfg["camera"]["device"]
@@ -463,7 +475,8 @@ def snapshot(cfg: Dict[str, Any], cap=None) -> Dict[str, Any]:
         snap.update(controls=ctr, driver_fps=v4l2_driver_fps(dev), format=v4l2_format(dev))
     elif cap is not None:   # other platforms: OpenCV read-back, units are backend-specific
         snap["opencv"] = {k: float(cap.get(CONTROL_MAP[k][1])) for k in _SNAP_PROPS}
-    summ: Dict[str, Any] = {"exposure_mode": None, "exposure_absolute": None, "exposure_ms": None, "gain": None,
+    summ: Dict[str, Any] = {"exposure_mode": None, "exposure_absolute": None, "exposure_ms": None,
+                            "exposure_unit_ms": exposure_unit_ms(cfg), "gain": None,
                             "driver_fps": snap.get("driver_fps")}
     if ctr:
         ae = ctr.get("exposure_auto") or ctr.get("auto_exposure") or {}
@@ -473,7 +486,7 @@ def snapshot(cfg: Dict[str, Any], cap=None) -> Dict[str, Any]:
         if isinstance(ea.get("value"), int):
             summ["exposure_absolute"] = ea["value"]
             if summ["exposure_mode"] == "manual":
-                summ["exposure_ms"] = 0.1 * ea["value"]
+                summ["exposure_ms"] = exposure_unit_ms(cfg) * ea["value"]
         if isinstance(ctr.get("gain", {}).get("value"), int):
             summ["gain"] = ctr["gain"]["value"]
     snap["summary"] = summ
@@ -490,8 +503,11 @@ def marker_fields(snap: Optional[dict], stab: Optional[dict], locked: bool) -> D
     """Flat camera keys for the <stem>.done marker, so an analysis can read them without the settings file.
 
     Every V4L2 control at the start of the clip is copied under its driver name (raw driver value), plus:
-      exposure        = exposure_absolute, in UVC units of 100 us (exposure_ms = exposure / 10); only in manual mode,
+      exposure        = exposure_absolute, raw camera units; only in manual mode,
                         because in auto mode the stored value is stale ('inactive') and not the integration time used
+      exposure_ms     = exposure x exposure_unit_ms: integration time [ms]
+      exposure_unit_ms = duration of one exposure unit [ms]: measured by scintcam diagnose (camera profile), else the
+                        UVC standard 0.1 ms, which many webcams do not follow
       format          = "<pixel format> <width>x<height>" streamed by the driver
       camera_locked   = whether scintcam pinned the controls (camera.lock)
       stab_drift_pct, stab_rms_pct = last stability check, only when it could judge (lit scene)
@@ -501,8 +517,12 @@ def marker_fields(snap: Optional[dict], stab: Optional[dict], locked: bool) -> D
     for name, d in ctr.items():
         if "value" in d:
             out[name] = d["value"]
-    if (snap or {}).get("summary", {}).get("exposure_mode") == "manual":
-        out["exposure"] = snap["summary"]["exposure_absolute"]
+    summ = (snap or {}).get("summary", {})
+    if summ.get("exposure_mode") == "manual":
+        out["exposure"] = summ["exposure_absolute"]
+        if summ.get("exposure_ms") is not None:
+            out["exposure_ms"] = round(summ["exposure_ms"], 4)
+            out["exposure_unit_ms"] = summ["exposure_unit_ms"]
     fmt = (snap or {}).get("format") or {}
     if fmt.get("pixel_format") and fmt.get("width"):
         out["format"] = f"{fmt['pixel_format']} {fmt['width']}x{fmt['height']}"

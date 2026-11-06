@@ -371,7 +371,8 @@ class App:
             self.read_camera()
             s = self.cam_snap["summary"]
             log.info("camera now: exposure %s%s, gain %s, driver %s fps", s["exposure_mode"],
-                     "" if s["exposure_ms"] is None else f" {s['exposure_ms']:g} ms", s["gain"], s["driver_fps"])
+                     "" if s["exposure_ms"] is None else f" {s['exposure_ms']:.4g} ms ({s['exposure_absolute']} steps)",
+                     s["gain"], s["driver_fps"])
         if self.engine is not None:
             try:
                 self._render()
@@ -589,7 +590,8 @@ class App:
         fmt = self.cam_snap.get("format") or {}
         size = f"{fmt.get('width', self.cam_size[0])}x{fmt.get('height', self.cam_size[1])} {fmt.get('pixel_format', '')}"
         ems = s["exposure_ms"] if s["exposure_ms"] is not None else (
-            0.1 * s["exposure_absolute"] if s["exposure_mode"] == "auto" and s["exposure_absolute"] is not None else None)
+            self._unit() * s["exposure_absolute"] if s["exposure_mode"] == "auto" and s["exposure_absolute"] is not None
+            else None)
         exp = (f"{s['exposure_mode']}" + (f", {ems:.1f} ms" if ems is not None else "")
                if s["exposure_mode"] else "n/a (no v4l2-ctl)")
         self._fill_camera_fields()
@@ -610,8 +612,8 @@ class App:
                 val = summ.get("exposure_ms")
                 if auto:      # shown only once it differs from the stored manual value, i.e. it is really live
                     ea = summ.get("exposure_absolute")
-                    val = 0.1 * ea if ea is not None and ea != self._ae_stale else None
-                var.set("" if val is None else f"{val:g}")
+                    val = self._unit() * ea if ea is not None and ea != self._ae_stale else None
+                var.set("" if val is None else f"{val:.4g}")
                 self._cam_shown[key] = var.get()
                 have = "exposure_absolute" in ctr or "exposure_time_absolute" in ctr
             else:
@@ -629,6 +631,10 @@ class App:
 
     def _profile_ctl(self, name):
         return ((self.cfg.get("_profile") or {}).get("controls") or {}).get(name)
+
+    def _unit(self):
+        """Exposure unit [ms per camera step]: measured (camera profile) or UVC standard 0.1 ms."""
+        return camera.exposure_unit_ms(self.cfg)
 
     def _profile_exp(self):
         return (self.cfg.get("_profile") or {}).get("exposure") or {}
@@ -650,15 +656,16 @@ class App:
                 num = float(txt)
             except ValueError:
                 raise ValueError(f"{key}: '{txt}' is not a number")
-            if key == "exposure_ms":           # UVC exposure unit = 100 us
-                name, val = "exposure", int(round(num * 10))
+            if key == "exposure_ms":           # ms -> camera steps (unit from the camera profile)
+                name, val = "exposure", int(round(num / self._unit()))
                 d = ctr.get("exposure_absolute") or ctr.get("exposure_time_absolute") or {}
             else:
                 name, val = key, int(round(num))
                 d = ctr.get(CAM_V4L2[key], {})
             lo, hi = d.get("min"), d.get("max")
             if not unchanged and isinstance(lo, int) and isinstance(hi, int) and not lo <= val <= hi:
-                shown = (f"{lo / 10:g}-{hi / 10:g} ms" if key == "exposure_ms" else f"{lo}-{hi}")
+                u = self._unit()
+                shown = (f"{lo * u:.4g}-{hi * u:.4g} ms" if key == "exposure_ms" else f"{lo}-{hi}")
                 raise ValueError(f"{key}: {num:g} outside the camera's range {shown}; nothing applied")
             out[name] = val
         if "exposure" in out:
@@ -684,9 +691,9 @@ class App:
         self.btn_apply.state(["disabled"])
         log.info("applying camera settings: %s", ", ".join(f"{k}={v}" for k, v in vals.items()))
         ex = self._profile_exp()
-        if "exposure" in vals and ex.get("full_rate_max_ms") and 0.1 * vals["exposure"] > ex["full_rate_max_ms"]:
-            log.warning("%.1f ms is above %.1f ms: on this camera the frame rate drops (camera profile)",
-                        0.1 * vals["exposure"], ex["full_rate_max_ms"])
+        if "exposure" in vals and ex.get("full_rate_max") and vals["exposure"] > ex["full_rate_max"]:
+            log.warning("%.4g ms is above %.4g ms: on this camera the frame rate drops (camera profile)",
+                        self._unit() * vals["exposure"], self._unit() * ex["full_rate_max"])
         settle = float(ex.get("settle_s") or 0.5)
 
         def work():        # v4l2-ctl calls and the auto->manual pause take ~0.5 s: off the GUI thread
@@ -702,8 +709,8 @@ class App:
         if self._ae_read is not None:
             ms, self._ae_read = self._ae_read, None
             if self.var_ae.get() and not self._cam_busy and self._ae_stale is not None \
-                    and round(ms * 10) != self._ae_stale:
-                txt = f"{ms:g}"
+                    and round(ms / self._unit()) != self._ae_stale:
+                txt = f"{ms:.4g}"
                 self.cam_entries["exposure_ms"][0].set(txt)
                 self._cam_shown["exposure_ms"] = txt
                 self.lbl_ae.configure(text="ON: not for measurements")
@@ -718,7 +725,7 @@ class App:
             ctr = camera.v4l2_controls(dev) or {}
             ea = ctr.get("exposure_absolute") or ctr.get("exposure_time_absolute") or {}
             if isinstance(ea.get("value"), int):
-                self._ae_read = 0.1 * ea["value"]
+                self._ae_read = self._unit() * ea["value"]
             if (ctr.get("exposure_auto") or ctr.get("auto_exposure") or {}).get("value") == 1:
                 self._ae_read = None       # switched to manual meanwhile
         threading.Thread(target=work, daemon=True).start()
@@ -764,9 +771,10 @@ class App:
     def _match_auto_level(self):
         """Worker: auto -> manual, then set the manual exposure that gives the level auto exposure had.
 
-        Many cameras return to their stored manual exposure on that switch, and do not report the exposure auto
-        used, so the level is matched instead: E_next = E * L_auto / L (level ~ exposure), repeated until
-        |L - L_auto| <= max(2 counts, 3 %)."""
+        Many cameras return to their stored manual exposure on that switch, or keep the auto one without reporting
+        it, so the level is matched instead: E_next = E L_auto / L, with E exposure [camera steps], L mean level
+        [counts] (level ~ exposure), repeated until |L - L_auto| <= max(2 counts, 3 %). The final E is a written,
+        known value, so the clips log the exposure really in use."""
         cam, ex = self.cfg["camera"], self._profile_exp()
         settle = float(ex.get("settle_s") or 1.0)
         target = self._level(10)
@@ -786,7 +794,15 @@ class App:
         tol = max(2.0, 0.03 * target)
         strategy = camera.exposure_strategy(self.cfg)
         changed = False
-        for _ in range(6):
+        if ex.get("auto_readback") != "live" and isinstance(e, int):
+            # the read-back is the stored number, not necessarily the exposure in use (a camera that keeps the auto
+            # exposure still reports the old stored value): write a known exposure, then match from there
+            camera.apply_exposure(cam["device"], e, strategy, cam["exposure_cycle_delay_s"])
+            time.sleep(settle)
+            lv, changed = self._level(8), True
+            if lv is None:
+                return
+        for _ in range(8):
             if abs(lv - target) <= tol or not isinstance(e, int):
                 break
             new = e / 2 if lv >= 250 else (e * 4 if lv < 1 else e * target / lv)
@@ -802,11 +818,12 @@ class App:
         if changed:
             cam["controls"]["exposure"] = e
         log.info("auto exposure OFF: manual %s, level %.1f (auto gave %.1f)",
-                 f"{0.1 * e:g} ms" if isinstance(e, int) else "exposure", lv, target)
+                 f"{self._unit() * e:.4g} ms" if isinstance(e, int) else "exposure", lv, target)
         if abs(lv - target) > tol:
             log.warning("could not match the auto brightness within 3 %%: set exposure (ms) by hand")
-        if isinstance(e, int) and ex.get("full_rate_max_ms") and 0.1 * e > ex["full_rate_max_ms"]:
-            log.warning("%.1f ms is above %.1f ms: on this camera the frame rate drops", 0.1 * e, ex["full_rate_max_ms"])
+        if isinstance(e, int) and ex.get("full_rate_max") and e > ex["full_rate_max"]:
+            log.warning("%.4g ms is above %.4g ms: on this camera the frame rate drops",
+                        self._unit() * e, self._unit() * ex["full_rate_max"])
 
     def save_camera(self):
         path = self.cfg.get("_path")

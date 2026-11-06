@@ -31,18 +31,24 @@ def fakecam(tmp_path, monkeypatch):
     return state
 
 
-@pytest.mark.parametrize("behaviour,readback,clamp,apply,auto_rb,after", [
-    ("latch_stored", "stale", False, "store_then_cycle", "stale", "returns_to_stored"),   # the TANDAR webcam
-    ("keeps_auto", "live", True, "direct", "live", "keeps_auto"),
+DV20 = dict(unit_s=1.31e-6, k=0.00657, exp_range=(80, 100000))   # the TANDAR webcam, as its diagnosis measured it
+
+
+@pytest.mark.parametrize("behaviour,readback,clamp,extra,apply,auto_rb,after", [
+    ("latch_stored", "stale", False, {}, "store_then_cycle", "stale", "returns_to_stored"),
+    ("keeps_auto", "live", True, {}, "direct", "live", "keeps_auto"),
+    ("keeps_auto", "stale", True, DV20, "direct", "stale", "keeps_auto"),
 ])
-def test_diagnose_classifies_camera(fakecam, tmp_path, behaviour, readback, clamp, apply, auto_rb, after):
-    fakeuvc.make_state(str(fakecam), behaviour, readback, clamp)
+def test_diagnose_classifies_camera(fakecam, tmp_path, behaviour, readback, clamp, extra, apply, auto_rb, after):
+    fakeuvc.make_state(str(fakecam), behaviour, readback, clamp, **extra)
     out = tmp_path / "camera_profile.json"
     assert D.run(load_config(None), str(out)) == 0
     p = json.loads(out.read_text())
     ex = p["exposure"]
     assert ex["apply"] == apply and ex["auto_readback"] == auto_rb and ex["manual_after_auto"] == after
     assert ex["out_of_range"] == ("clamped" if clamp else "accepted")
+    unit_true = 1e3 * extra.get("unit_s", 1e-4)              # exposure unit measured from the frame rate
+    assert abs(ex["unit_ms_measured"] / unit_true - 1) < 0.1
     assert 28.0 <= ex["full_rate_max_ms"] <= 40.0          # sensor slows down above 1/30 s (sim timing jitter)
     assert ex["response"]["r2"] > 0.99
     eff = {n: e.get("effect") for n, e in p["controls"].items()}

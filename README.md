@@ -79,7 +79,8 @@ on and a static, unsaturated scene; it takes about 3 minutes and restores the ca
 | exposure method | level after writing a new exposure in manual (*direct*), after a short auto → manual switch (*store_then_cycle*), after writing it in auto (*write_in_auto*) | applying an exposure on the first try |
 | latency | time from the command to the new level in the image | waiting before reading back |
 | auto exposure | level and read-back in auto; level after auto → manual | whether to show the auto value; matching on switch-off |
-| exposure scan | level, saturated fraction and delivered frame rate for 10 exposures; frame-rate limit by bisection; fit level = a + b·exposure | warning when an exposure slows the camera; linearity (R², power) |
+| exposure scan | level, saturated fraction and delivered frame rate for 10+ exposures; frame-rate limit by bisection; fit level = a + b·exposure | warning when an exposure slows the camera; linearity (R², power) |
+| exposure unit | beyond the limit the frame period follows the exposure: 1/fps = u·E + d (u duration of one step, E exposure in camera steps, d readout time); u is the fitted slope | converting camera steps to ms everywhere (fields, log, `.done` marker) |
 | other controls | each integer control moved by ¼ of its range: change of level and colour, read-back, out-of-range write (clamped / error / accepted), reversibility | marking controls without effect |
 | reopen | level and mode after closing and reopening the stream | knowing whether settings survive a restart |
 
@@ -155,8 +156,11 @@ move it, Enter preview/accept, Esc back/cancel.
 - **Rectification** composes the radial correction and the homography into one lookup map, so each frame is
   interpolated once. Radial distortion is fitted from lines picked on straight edges; short edges near the image
   centre cannot constrain it, use long edges far from the centre.
-- **Exposure.** UVC exposure is in units of 100 µs (400 = 40 ms). Longer than one frame period (1/fps), the camera
-  slows down; the profile gives the exact limit. Many UVC cameras only apply a manual exposure on the auto → manual
+- **Exposure.** The UVC standard unit of `exposure_absolute` is 100 µs, but many webcams do not follow it (the
+  TANDAR DV20 webcam: about 1.3 µs per step, so 400 steps = 0.5 ms, not 40 ms). `scintcam diagnose` measures the
+  unit from the frame rate, and scintcam then shows and logs real milliseconds: the `.done` marker carries `exposure`
+  (camera steps), `exposure_ms` and `exposure_unit_ms`. Longer than one frame period, the camera slows down; the
+  profile gives the exact limit. Many UVC cameras only apply a manual exposure on the auto → manual
   transition, and use the value stored at that moment; the camera profile says how this camera takes it, and without
   a profile the full sequence is used. If you set exposure by another procedure, leave `exposure` out of
   `[camera.controls]`: it is then not touched. Values out of the driver's declared range are refused in the Camera

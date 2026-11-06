@@ -7,6 +7,9 @@ ways real cameras differ:
               "keeps_auto"    manual writes apply at once; auto -> manual keeps the auto exposure (and stores it)
   readback  = "live" | "stale"  what exposure_absolute reports while auto is on
   clamp     = True | False      out-of-range writes clamped (uvcvideo) or accepted as is
+  unit_s    = duration of one exposure step [s] (UVC standard 1e-4; the TANDAR DV20 webcam about 1.3e-6)
+  k         = level per exposure step [counts]
+A camera with stale read-back that keeps the auto exposure does not update the stored register either (DV20).
 """
 import json
 import os
@@ -31,9 +34,12 @@ CONTROLS = {
 }
 
 
-def make_state(path, behaviour="direct", readback="live", clamp=True):
-    st = {"controls": json.loads(json.dumps(CONTROLS)), "behaviour": behaviour, "readback": readback,
-          "clamp": clamp, "active": CONTROLS["exposure_absolute"]["value"]}
+def make_state(path, behaviour="direct", readback="live", clamp=True, unit_s=1e-4, k=0.4, exp_range=None):
+    ctl = json.loads(json.dumps(CONTROLS))
+    if exp_range:
+        ctl["exposure_absolute"].update(min=exp_range[0], max=exp_range[1])
+    st = {"controls": ctl, "behaviour": behaviour, "readback": readback, "clamp": clamp, "unit_s": unit_s, "k": k,
+          "active": ctl["exposure_absolute"]["value"]}
     with open(path, "w") as f:
         json.dump(st, f)
     return path
@@ -57,15 +63,16 @@ def _v(st, k):
 
 def level_of(st, active):
     """Mean grey level for an active exposure (units of 100 us) and the current gain/brightness/contrast/gamma."""
-    lv = 8 + 0.5 * _v(st, "brightness") + 0.4 * active * (1 + _v(st, "gain") / 25.0) * _v(st, "contrast") / 32.0
+    lv = 8 + 0.5 * _v(st, "brightness") + st.get("k", 0.4) * active * (1 + _v(st, "gain") / 25.0) * _v(st, "contrast") / 32.0
     lv = min(max(lv, 0.0), 255.0)
     return 255.0 * (lv / 255.0) ** (100.0 / _v(st, "gamma"))
 
 
 def auto_target(st):
     """Exposure the auto loop settles on: level 128 (solved on the linear part, before gamma)."""
-    k = 0.4 * (1 + _v(st, "gain") / 25.0) * _v(st, "contrast") / 32.0
-    return int(min(max((128 - 8 - 0.5 * _v(st, "brightness")) / max(k, 1e-6), 3), 2047))
+    k = st.get("k", 0.4) * (1 + _v(st, "gain") / 25.0) * _v(st, "contrast") / 32.0
+    d = st["controls"]["exposure_absolute"]
+    return int(min(max((128 - 8 - 0.5 * _v(st, "brightness")) / max(k, 1e-9), d["min"]), d["max"]))
 
 
 def in_use(st):
@@ -117,8 +124,9 @@ def ctl_main(argv):
             d["value"] = v
             if old == 3 and v == 1:
                 if beh == "keeps_auto":
-                    st["active"] = auto_target(dict(st, controls=c))
-                    c["exposure_absolute"]["value"] = st["active"]
+                    st["active"] = auto_target(st)
+                    if st["readback"] == "live":
+                        c["exposure_absolute"]["value"] = st["active"]
                 else:
                     st["active"] = c["exposure_absolute"]["value"]
         elif k == "exposure_absolute":
@@ -155,7 +163,7 @@ class FakeUVCCap:
     def read(self):
         st = _load()
         a = in_use(st)
-        time.sleep(max(1 / 30.0, a * 1e-4) * self.scale)
+        time.sleep(max(1 / 30.0, a * st.get("unit_s", 1e-4)) * self.scale)
         lv = level_of(st, a)
         sat = _v(st, "saturation") / 64.0
         wb = 0.0 if _v(st, "white_balance_temperature_auto") else (_v(st, "white_balance_temperature") - 4600) / 4600
