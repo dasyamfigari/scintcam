@@ -337,7 +337,9 @@ class Diagnosis:
                 a_, b_ = (mid, b_) if f >= RATE_DROP * f0 else (a_, mid)
         pts = [(x["exposure"], 1.0 / x["fps"]) for x in slow if x["fps"] > 0]
         if b_:
-            for fac in (1.3, 1.7):   # two more points beyond the limit for the slope
+            # points from just above the limit outwards: those near the limit pin the crossing with the full-rate
+            # frame period, the far ones the slope (u and d are strongly anticorrelated if only far points are used)
+            for fac in (1.08, 1.15, 1.25, 1.4, 1.7, 2.2, 3.0):
                 e = self.clampe(b_ * fac)
                 if e not in [p[0] for p in pts] and e > b_:
                     st = self._point(e, method)
@@ -347,24 +349,40 @@ class Diagnosis:
         if len(pts) >= 2 and max(p[0] for p in pts) > 1.15 * min(p[0] for p in pts):
             x = np.array([p[0] for p in pts], float)
             y = np.array([p[1] for p in pts]) / SCALE
-            u, dd = np.polyfit(x, y, 1)
+            if len(pts) >= 4:
+                (u, dd), cov = np.polyfit(x, y, 1, cov=True)
+            else:
+                (u, dd), cov = np.polyfit(x, y, 1), np.full((2, 2), np.nan)
             r2 = 1 - ((y - (u * x + dd)) ** 2).sum() / max(((y - y.mean()) ** 2).sum(), 1e-18)
             u, dd = float(u), float(dd)
-            r["unit_fit"] = {"points": len(pts), "unit_us": round(u * 1e6, 4), "readout_ms": round(dd * 1e3, 3),
+            # limit E_lim = (T0 - d) / u, T0 = 1/f0; its variance from the fit covariance:
+            #   var(E_lim) = [var(d) + E_lim^2 var(u) + 2 E_lim cov(u, d)] / u^2
+            t0 = 1.0 / f0 / SCALE
+            e_lim = (t0 - dd) / u
+            var_lim = (cov[1, 1] + e_lim ** 2 * cov[0, 0] + 2 * e_lim * cov[0, 1]) / u ** 2
+            r["unit_fit"] = {"points": len(pts), "unit_us": round(u * 1e6, 4),
+                             "unit_us_err": round(float(np.sqrt(cov[0, 0])) * 1e6, 4) if np.isfinite(cov[0, 0]) else None,
+                             "readout_ms": round(dd * 1e3, 3),
+                             "readout_ms_err": round(float(np.sqrt(cov[1, 1])) * 1e3, 3) if np.isfinite(cov[1, 1]) else None,
+                             "limit_ms_err": round(float(np.sqrt(var_lim)) * u * 1e3, 3) if np.isfinite(var_lim) else None,
                              "r2": round(float(r2), 5)}
-            self.say(f"frame period = {u * 1e6:.4f} us x exposure + {dd * 1e3:.2f} ms   (R2 {r2:.4f}, {len(pts)} points)")
+            f = r["unit_fit"]
+            self.say(f"frame period = ({u * 1e6:.4f} +- {f['unit_us_err']}) us x exposure + ({dd * 1e3:.2f} +- "
+                     f"{f['readout_ms_err']}) ms   (R2 {r2:.4f}, {len(pts)} points; limit +- {f['limit_ms_err']} ms)")
             if u > 0 and r2 > 0.98:
                 unit, src = u * 1e3, "measured from the frame rate"
                 r["unit_ms_measured"] = round(unit, 7)
                 # longest exposure that still fits the full-rate frame: E_lim = (T_frame - d) / u, with T_frame = 1/f0
-                lim = int((1.0 / f0 / SCALE - dd) / u)
+                lim = int(e_lim)
                 if a_ is not None and b_ is not None and 0.8 * a_ <= lim <= b_:
                     a_ = lim
         r["unit_ms"], r["unit_source"] = round(unit, 7), src
         for x in rows:
             x["ms"] = round(x["exposure"] * unit, 3)
         if "unit_ms_measured" in r:
-            msg = f"1 exposure unit = {unit * 1e3:.3f} us (measured from the frame rate; UVC standard: 100 us)"
+            err = r["unit_fit"].get("unit_us_err")
+            msg = (f"1 exposure unit = {unit * 1e3:.3f}{f' +- {err:.3f}' if err else ''} us "
+                   f"(measured from the frame rate; UVC standard: 100 us)")
             if abs(unit / UNIT_MS - 1) > 0.1:
                 msg += f": this camera does NOT use 100 us; 'exposure / 10 ms' is wrong by x{UNIT_MS / unit:.1f}"
             self.note(msg)
@@ -373,7 +391,8 @@ class Diagnosis:
         if slow:
             r["full_rate_max"], r["rate_drops_from"] = a_, b_
             r["full_rate_max_ms"] = round(a_ * unit, 3) if a_ else None
-            self.note(f"exposure above {a_} ({a_ * unit:.1f} ms) lowers the frame rate "
+            le = (r.get("unit_fit") or {}).get("limit_ms_err")
+            self.note(f"exposure above {a_} ({a_ * unit:.1f}{f' +- {le:.1f}' if le else ''} ms) lowers the frame rate "
                       f"({f0:.1f} fps -> {slow[-1]['fps']:.1f} fps at {slow[-1]['exposure']})" if a_ else
                       "the frame rate drops at every exposure tested")
         sat = [x for x in rows if x["sat"] > 0.01 or x["level"] > 245]
